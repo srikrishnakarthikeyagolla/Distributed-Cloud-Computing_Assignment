@@ -2,18 +2,64 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { rateLimit } from "express-rate-limit";
-import { createUser, DuplicateEmailError, findUserByEmail, findUserById } from "../models/User.js";
+import { randomUUID } from "node:crypto";
+import multer from "multer";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  createUser,
+  DuplicateEmailError,
+  findUserByEmail,
+  findUserById,
+  findUsersByPincode,
+  updateUserPasswordHash,
+  updateUserProfilePhoto,
+  updateUserVisibility,
+} from "../models/User.js";
+import { findConnection } from "../models/Connection.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 
 const router = Router();
 const passwordPattern = /^[^\s]{8,72}$/;
 const pincodePattern = /^[\p{L}\p{N}][\p{L}\p{N} -]{1,11}$/u;
+const profilePhotoDirectory = fileURLToPath(new URL("../../data/profile-photos/", import.meta.url));
+const photoTypes = new Map([
+  ["image/jpeg", { extension: ".jpg", signature: (buffer) => buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff }],
+  ["image/png", { extension: ".png", signature: (buffer) => buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) }],
+  ["image/webp", { extension: ".webp", signature: (buffer) => buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP" }],
+]);
+const photoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+  fileFilter: (_request, file, callback) => {
+    if (!photoTypes.has(file.mimetype)) {
+      callback(new Error("Upload a JPG, PNG, or WebP profile photo."));
+      return;
+    }
+    callback(null, true);
+  },
+});
 const authRateLimit = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 30,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { error: "Too many attempts. Please wait a little and try again." },
+});
+const passwordRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many password changes. Please wait before trying again." },
+});
+const photoRateLimit = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many profile photo uploads. Please wait before trying again." },
 });
 
 function publicUser(user) {
@@ -26,7 +72,31 @@ function publicUser(user) {
     job: user.job,
     workplace: user.workplace,
     interests: user.interests,
+    visibility: user.visibility || "connections",
+    profilePhotoUrl: user.profilePhoto
+      ? `/api/auth/profile-photo/${user.id}?v=${encodeURIComponent(user.profilePhoto)}`
+      : null,
   };
+}
+
+function photoPath(fileName) {
+  if (!/^[0-9a-f-]{36}\.(jpg|png|webp)$/i.test(fileName)) {
+    throw new Error("Invalid profile photo filename.");
+  }
+  return join(profilePhotoDirectory, fileName);
+}
+
+function profilePhotoUpload(request, response, next) {
+  photoUpload.single("photo")(request, response, (error) => {
+    if (!error) return next();
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      return response.status(413).json({ error: "Profile photos must be 2 MB or smaller." });
+    }
+    if (error instanceof multer.MulterError) {
+      return response.status(400).json({ error: "Upload one profile photo at a time." });
+    }
+    return response.status(400).json({ error: error.message });
+  });
 }
 
 function setSessionCookie(response, userId) {
@@ -84,7 +154,17 @@ router.post("/signup", authRateLimit, async (request, response, next) => {
   try {
     const { name, email, password, pincode, address, job, workplace, interests } = result.value;
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await createUser({ name, email, passwordHash, pincode, address, job, workplace, interests });
+    const user = await createUser({
+      name,
+      email,
+      passwordHash,
+      pincode,
+      address,
+      job,
+      workplace,
+      interests,
+      visibility: "connections",
+    });
     setSessionCookie(response, user.id);
     return response.status(201).json({ user: publicUser(user) });
   } catch (error) {
@@ -137,6 +217,148 @@ router.get("/me", requireAuth, async (request, response, next) => {
     }
     return response.json({ user: publicUser(user) });
   } catch (error) {
+    return next(error);
+  }
+});
+
+router.put("/visibility", requireAuth, async (request, response, next) => {
+  const { visibility } = request.body ?? {};
+  if (!["public", "private", "connections"].includes(visibility)) {
+    return response.status(400).json({ error: "Choose public, private, or connections visibility." });
+  }
+  try {
+    const user = await updateUserVisibility(request.userId, visibility);
+    if (!user) return response.status(404).json({ error: "Your account could not be found." });
+    const neighbors = await findUsersByPincode(user.pincode, user.id);
+    for (const neighbor of neighbors) {
+      request.app.get("io")?.to(`user:${neighbor.id}`).emit("profile:update");
+    }
+    return response.json({ visibility: user.visibility });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put("/password", requireAuth, passwordRateLimit, async (request, response, next) => {
+  const { currentPassword, newPassword } = request.body ?? {};
+  if (
+    typeof currentPassword !== "string" ||
+    currentPassword.length === 0 ||
+    currentPassword.length > 72 ||
+    typeof newPassword !== "string" ||
+    !passwordPattern.test(newPassword)
+  ) {
+    return response.status(400).json({
+      error: "Enter your current password and a new password of 8–72 characters with no spaces.",
+    });
+  }
+
+  try {
+    const user = await findUserById(request.userId);
+    if (!user || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
+      return response.status(400).json({ error: "Your current password is incorrect." });
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 12);
+    const updatedUser = await updateUserPasswordHash(user.id, passwordHash);
+    if (!updatedUser) return response.status(404).json({ error: "Your account could not be found." });
+    return response.json({ message: "Password updated." });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/profile-photo", requireAuth, photoRateLimit, profilePhotoUpload, async (request, response, next) => {
+  if (!request.file) return response.status(400).json({ error: "Choose a profile photo to upload." });
+  const photoType = photoTypes.get(request.file.mimetype);
+  if (!photoType.signature(request.file.buffer)) {
+    return response.status(400).json({ error: "The selected file is not a valid JPG, PNG, or WebP image." });
+  }
+
+  let destination;
+  let saved = false;
+  try {
+    const existingUser = await findUserById(request.userId);
+    if (!existingUser) return response.status(404).json({ error: "Your account could not be found." });
+    const fileName = `${randomUUID()}${photoType.extension}`;
+    destination = photoPath(fileName);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, request.file.buffer, { flag: "wx", mode: 0o600 });
+    const result = await updateUserProfilePhoto(existingUser.id, fileName);
+    if (!result) {
+      await rm(destination, { force: true });
+      return response.status(404).json({ error: "Your account could not be found." });
+    }
+    saved = true;
+    if (result.previousPhoto) {
+      await rm(photoPath(result.previousPhoto), { force: true });
+    }
+    const neighbors = await findUsersByPincode(existingUser.pincode, existingUser.id);
+    for (const neighbor of neighbors) {
+      request.app.get("io")?.to(`user:${neighbor.id}`).emit("profile:update");
+    }
+    return response.json({ user: publicUser(result.user) });
+  } catch (error) {
+    if (destination && !saved) {
+      try {
+        await rm(destination, { force: true });
+      } catch (cleanupError) {
+        return next(new AggregateError([error, cleanupError], "Failed to save profile photo and clean up its file."));
+      }
+    }
+    return next(error);
+  }
+});
+
+router.delete("/profile-photo", requireAuth, async (request, response, next) => {
+  try {
+    const user = await findUserById(request.userId);
+    if (!user) return response.status(404).json({ error: "Your account could not be found." });
+    if (user.profilePhoto) {
+      const result = await updateUserProfilePhoto(user.id, null);
+      if (!result) return response.status(404).json({ error: "Your account could not be found." });
+      await rm(photoPath(user.profilePhoto), { force: true });
+    }
+    const neighbors = await findUsersByPincode(user.pincode, user.id);
+    for (const neighbor of neighbors) {
+      request.app.get("io")?.to(`user:${neighbor.id}`).emit("profile:update");
+    }
+    return response.json({ user: publicUser({ ...user, profilePhoto: null }) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/profile-photo/:userId", requireAuth, async (request, response, next) => {
+  try {
+    const [viewer, target] = await Promise.all([
+      findUserById(request.userId),
+      findUserById(request.params.userId),
+    ]);
+    if (!viewer || !target || !target.profilePhoto) {
+      return response.status(404).json({ error: "Profile photo not found." });
+    }
+    if (viewer.id !== target.id) {
+      const sameArea = viewer.pincode.trim().toUpperCase() === target.pincode.trim().toUpperCase();
+      const connection = await findConnection(viewer.id, target.id);
+      const allowed =
+        sameArea &&
+        (target.visibility === "public" ||
+          ((target.visibility || "connections") === "connections" && connection?.status === "accepted"));
+      if (!allowed) return response.status(404).json({ error: "Profile photo not found." });
+    }
+    if (typeof target.profilePhoto !== "string") {
+      return response.status(404).json({ error: "Profile photo not found." });
+    }
+    const photoType = [...photoTypes.entries()].find(([, value]) => target.profilePhoto.endsWith(value.extension));
+    if (!photoType) return response.status(404).json({ error: "Profile photo not found." });
+    const contents = await readFile(photoPath(target.profilePhoto));
+    return response
+      .type(photoType[0])
+      .set("X-Content-Type-Options", "nosniff")
+      .set("Cache-Control", "private, no-store")
+      .send(contents);
+  } catch (error) {
+    if (error.code === "ENOENT") return response.status(404).json({ error: "Profile photo not found." });
     return next(error);
   }
 });

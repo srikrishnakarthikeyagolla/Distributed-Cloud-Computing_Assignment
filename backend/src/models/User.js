@@ -119,3 +119,31 @@ export function findUsersByPincode(pincode, excludingId) {
     write: false,
   }));
 }
+
+export function updateUserVisibility(userId, visibility) {
+  return withUsers((users) => {
+    const user = users.find((item) => item.id === userId);
+    if (!user) return { value: null, write: false };
+    user.visibility = visibility;
+    return { value: user, write: true };
+  });
+}
+
+export function updateUserPasswordHash(userId, passwordHash) {
+  return withUsers((users) => {
+    const user = users.find((item) => item.id === userId);
+    if (!user) return { value: null, write: false };
+    user.passwordHash = passwordHash;
+    return { value: user, write: true };
+  });
+}
+
+export function updateUserProfilePhoto(userId, profilePhoto) {
+  return withUsers((users) => {
+    const user = users.find((item) => item.id === userId);
+    if (!user) return { value: null, write: false };
+    const previousPhoto = user.profilePhoto || null;
+    user.profilePhoto = profilePhoto;
+    return { value: { user, previousPhoto }, write: true };
+  });
+}

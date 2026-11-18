@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { io } from "socket.io-client";
 
 const emptyForm = {
   name: "",
@@ -12,9 +13,12 @@ const emptyForm = {
 };
 
 async function request(path, options = {}) {
+  const isFormData = options.body instanceof FormData;
   const response = await fetch(path, {
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...options.headers },
+    headers: isFormData
+      ? options.headers
+      : { "Content-Type": "application/json", ...options.headers },
     ...options,
   });
   const result = await response.json().catch(() => ({}));
@@ -28,8 +32,37 @@ async function request(path, options = {}) {
   return result;
 }
 
-function NeighborhoodDashboard({ user, onSignOut }) {
+function ProfileAvatar({ profile, className = "", blurred = false }) {
+  if (profile.profilePhotoUrl && !blurred) {
+    return (
+      <img
+        className={`avatar avatar-image ${className}`}
+        src={profile.profilePhotoUrl}
+        alt={`${profile.name} profile`}
+      />
+    );
+  }
+  return (
+    <span className={`avatar ${className}${blurred ? " identity-blurred" : ""}`} aria-hidden="true">
+      {profile.name?.charAt(0).toUpperCase() || "?"}
+    </span>
+  );
+}
+
+function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   const [people, setPeople] = useState([]);
+  const [connectionPeople, setConnectionPeople] = useState([]);
+  const [loadingConnections, setLoadingConnections] = useState(true);
+  const [pendingConnectionCount, setPendingConnectionCount] = useState(0);
+  const [activeView, setActiveView] = useState("messages");
+  const [connectionSearch, setConnectionSearch] = useState("");
+  const [visibility, setVisibility] = useState(user.visibility || "connections");
+  const [savingVisibility, setSavingVisibility] = useState(false);
+  const [photoUploading, setPhotoUploading] = useState(false);
+  const [savingPassword, setSavingPassword] = useState(false);
+  const [passwordForm, setPasswordForm] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
+  const [profileError, setProfileError] = useState("");
+  const [profileStatus, setProfileStatus] = useState("");
   const [selectedPerson, setSelectedPerson] = useState(null);
   const [messages, setMessages] = useState([]);
   const [search, setSearch] = useState("");
@@ -39,29 +72,134 @@ function NeighborhoodDashboard({ user, onSignOut }) {
   const [sending, setSending] = useState(false);
   const [chatError, setChatError] = useState("");
   const messagesEndRef = useRef(null);
+  const socketRef = useRef(null);
+  const selectedPersonRef = useRef(selectedPerson);
+  const connectionSearchRef = useRef(connectionSearch);
+  const searchRef = useRef(search);
+
+  useEffect(() => {
+    selectedPersonRef.current = selectedPerson;
+  }, [selectedPerson]);
+
+  useEffect(() => {
+    connectionSearchRef.current = connectionSearch;
+  }, [connectionSearch]);
+
+  useEffect(() => {
+    searchRef.current = search;
+  }, [search]);
+
+  useEffect(() => {
+    const socket = io({
+      withCredentials: true,
+    });
+    socketRef.current = socket;
+
+    socket.on("chat:message", (message) => {
+      const activePerson = selectedPersonRef.current;
+      if (
+        !activePerson ||
+        (message.senderId !== activePerson.id && message.recipientId !== activePerson.id)
+      ) {
+        return;
+      }
+      setMessages((current) =>
+        current.some((existing) => existing.id === message.id)
+          ? current
+          : [...current, message],
+      );
+    });
+
+    const refreshConnections = () => {
+      request(`/api/neighborhood/connections?search=${encodeURIComponent(connectionSearchRef.current)}`)
+        .then((result) => {
+          setConnectionPeople(result.people);
+          setPendingConnectionCount(result.pendingCount);
+        })
+        .catch((loadError) => setChatError(loadError.message));
+    };
+
+    socket.on("profile:update", () => {
+      loadPeople(searchRef.current).catch((loadError) => setChatError(loadError.message));
+    });
+    socket.on("profile:update", refreshConnections);
+    socket.on("connection:update", () => {
+      refreshConnections();
+      loadPeople(searchRef.current).catch((loadError) => setChatError(loadError.message));
+    });
+
+    socket.on("connect_error", () => {
+      setChatError("Live chat disconnected. Reconnecting…");
+    });
+
+    socket.on("connect", () => {
+      setChatError("");
+      const activePerson = selectedPersonRef.current;
+      if (activePerson) {
+        socket.emit("chat:join", activePerson.id);
+      }
+    });
+
+    return () => {
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
-
-    request("/api/neighborhood/people")
-      .then(({ people: neighbors }) => {
+    setLoadingPeople(true);
+    const timerId = window.setTimeout(async () => {
+      try {
+        await loadPeople(search, () => active);
         if (!active) return;
-        setPeople(neighbors);
-        setSelectedPerson((current) =>
-          current ? neighbors.find((person) => person.id === current.id) ?? null : neighbors[0] ?? null,
-        );
-      })
-      .catch((loadError) => {
+        setChatError("");
+      } catch (loadError) {
         if (active) setChatError(loadError.message);
-      })
-      .finally(() => {
+      } finally {
         if (active) setLoadingPeople(false);
-      });
+      }
+    }, search ? 220 : 0);
 
     return () => {
       active = false;
+      window.clearTimeout(timerId);
     };
-  }, []);
+  }, [search]);
+
+  async function loadPeople(query = search, shouldApply = () => true) {
+    const result = await request(
+      `/api/neighborhood/people?search=${encodeURIComponent(query)}`,
+    );
+    if (shouldApply()) {
+      setPeople(result.people);
+      setSelectedPerson((current) => {
+        if (!current) return result.people[0] ?? null;
+        return result.people.find((person) => person.id === current.id) ?? null;
+      });
+    }
+    return result;
+  }
+
+  async function loadConnections(query = connectionSearch) {
+    setLoadingConnections(true);
+    try {
+      const result = await request(
+        `/api/neighborhood/connections?search=${encodeURIComponent(query)}`,
+      );
+      setConnectionPeople(result.people);
+      setPendingConnectionCount(result.pendingCount);
+    } catch (loadError) {
+      setChatError(loadError.message);
+    } finally {
+      setLoadingConnections(false);
+    }
+  }
+
+  useEffect(() => {
+    const timerId = window.setTimeout(() => loadConnections(connectionSearch), connectionSearch ? 220 : 0);
+    return () => window.clearTimeout(timerId);
+  }, [connectionSearch]);
 
   useEffect(() => {
     if (!selectedPerson) {
@@ -100,10 +238,11 @@ function NeighborhoodDashboard({ user, onSignOut }) {
     setMessages([]);
     setLoadingMessages(true);
     loadMessages();
-    const intervalId = window.setInterval(loadMessages, 4000);
+    socketRef.current?.emit("chat:join", selectedPerson.id, (result) => {
+      if (result?.ok === false) setChatError(result.error);
+    });
     return () => {
       active = false;
-      window.clearInterval(intervalId);
     };
   }, [selectedPerson]);
 
@@ -119,14 +258,37 @@ function NeighborhoodDashboard({ user, onSignOut }) {
     setSending(true);
     setChatError("");
     try {
-      const { message } = await request(
-        `/api/neighborhood/messages/${encodeURIComponent(selectedPerson.id)}`,
-        { method: "POST", body: JSON.stringify({ content }) },
-      );
-      setMessages((current) =>
-        current.some((existing) => existing.id === message.id) ? current : [...current, message],
-      );
-      setDraft("");
+      const socket = socketRef.current;
+      if (!socket?.connected) {
+        const { message } = await request(
+          `/api/neighborhood/messages/${encodeURIComponent(selectedPerson.id)}`,
+          { method: "POST", body: JSON.stringify({ content }) },
+        );
+        setMessages((current) =>
+          current.some((existing) => existing.id === message.id) ? current : [...current, message],
+        );
+        setDraft("");
+      } else {
+        await new Promise((resolve, reject) => {
+          socket.emit(
+            "chat:send",
+            { recipientId: selectedPerson.id, content },
+            (result) => {
+              if (!result?.ok) {
+                reject(new Error(result?.error || "Could not send the message."));
+                return;
+              }
+              setMessages((current) =>
+                current.some((existing) => existing.id === result.message.id)
+                  ? current
+                  : [...current, result.message],
+              );
+              resolve();
+            },
+          );
+        });
+        setDraft("");
+      }
     } catch (sendError) {
       setChatError(sendError.message);
     } finally {
@@ -134,13 +296,137 @@ function NeighborhoodDashboard({ user, onSignOut }) {
     }
   }
 
-  const filteredPeople = people.filter((person) =>
-    `${person.name} ${person.job} ${person.workplace} ${(person.interests || []).join(" ")}`
-      .toLowerCase()
-      .includes(search.trim().toLowerCase()),
-  );
+  const filteredPeople = people;
+  const filteredConnectionPeople = connectionPeople;
   const selectedIsVisible = selectedPerson && filteredPeople.some((person) => person.id === selectedPerson.id);
   const lastMessage = selectedPerson && messages.length > 0 ? messages[messages.length - 1] : null;
+
+  async function updateConnection(person, action) {
+    try {
+      const result = await request(
+        action === "accept"
+          ? `/api/neighborhood/connections/${person.id}/accept`
+          : `/api/neighborhood/connections/${person.id}`,
+        { method: "POST" },
+      );
+      setConnectionPeople((current) =>
+        current.map((item) =>
+          item.id === person.id
+            ? { ...item, connectionStatus: result.connectionStatus }
+            : item,
+        ),
+      );
+      await Promise.all([loadConnections(), loadPeople()]);
+    } catch (connectionError) {
+      setChatError(connectionError.message);
+    }
+  }
+
+  async function updateVisibility(nextVisibility) {
+    setSavingVisibility(true);
+    setProfileError("");
+    setProfileStatus("");
+    try {
+      const result = await request("/api/auth/visibility", {
+        method: "PUT",
+        body: JSON.stringify({ visibility: nextVisibility }),
+      });
+      setVisibility(result.visibility);
+      setPeople([]);
+      setConnectionPeople([]);
+      const [peopleResult, connectionsResult] = await Promise.all([
+        request(`/api/neighborhood/people?search=${encodeURIComponent(search)}`),
+        request(`/api/neighborhood/connections?search=${encodeURIComponent(connectionSearch)}`),
+      ]);
+      setPeople(peopleResult.people);
+      setConnectionPeople(connectionsResult.people);
+      setPendingConnectionCount(connectionsResult.pendingCount);
+      setSelectedPerson((current) =>
+        current
+          ? peopleResult.people.find((person) => person.id === current.id) ?? current
+          : peopleResult.people[0] ?? null,
+      );
+      setProfileStatus("Your privacy settings have been updated.");
+    } catch (visibilityError) {
+      setProfileError(visibilityError.message);
+    } finally {
+      setSavingVisibility(false);
+    }
+  }
+
+  async function saveProfilePhoto(event) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const file = form.elements.photo.files[0];
+    if (!file) {
+      setProfileError("Choose a photo to upload.");
+      return;
+    }
+    if (file.size > 2 * 1024 * 1024) {
+      setProfileError("Profile photos must be 2 MB or smaller.");
+      return;
+    }
+
+    setPhotoUploading(true);
+    setProfileError("");
+    setProfileStatus("");
+    try {
+      const upload = new FormData();
+      upload.append("photo", file);
+      const result = await request("/api/auth/profile-photo", {
+        method: "POST",
+        body: upload,
+      });
+      onUserUpdated(result.user);
+      setProfileStatus("Your profile photo has been updated.");
+      form.reset();
+    } catch (photoError) {
+      setProfileError(photoError.message);
+    } finally {
+      setPhotoUploading(false);
+    }
+  }
+
+  async function removeProfilePhoto() {
+    setPhotoUploading(true);
+    setProfileError("");
+    setProfileStatus("");
+    try {
+      const result = await request("/api/auth/profile-photo", { method: "DELETE" });
+      onUserUpdated(result.user);
+      setProfileStatus("Your profile photo has been removed.");
+    } catch (photoError) {
+      setProfileError(photoError.message);
+    } finally {
+      setPhotoUploading(false);
+    }
+  }
+
+  async function changePassword(event) {
+    event.preventDefault();
+    setProfileError("");
+    setProfileStatus("");
+    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+      setProfileError("The new passwords don’t match.");
+      return;
+    }
+    setSavingPassword(true);
+    try {
+      const result = await request("/api/auth/password", {
+        method: "PUT",
+        body: JSON.stringify({
+          currentPassword: passwordForm.currentPassword,
+          newPassword: passwordForm.newPassword,
+        }),
+      });
+      setPasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+      setProfileStatus(result.message);
+    } catch (passwordError) {
+      setProfileError(passwordError.message);
+    } finally {
+      setSavingPassword(false);
+    }
+  }
 
   return (
     <main className="dashboard-page">
@@ -149,6 +435,34 @@ function NeighborhoodDashboard({ user, onSignOut }) {
           <span className="brand-mark">c.</span>
           <span>common<span className="brand-light">ground</span></span>
         </a>
+        <nav className="topbar-nav" aria-label="Primary navigation">
+          <button
+            className={`nav-button${activeView === "messages" ? " active" : ""}`}
+            type="button"
+            onClick={() => setActiveView("messages")}
+          >
+            Messages
+          </button>
+          <button
+            className={`nav-button${activeView === "connections" ? " active" : ""}`}
+            type="button"
+            onClick={() => setActiveView("connections")}
+          >
+            Connect
+            {pendingConnectionCount > 0 && (
+              <span className="nav-count" aria-label={`${pendingConnectionCount} pending requests`}>
+                {pendingConnectionCount}
+              </span>
+            )}
+          </button>
+          <button
+            className={`nav-button${activeView === "profile" ? " active" : ""}`}
+            type="button"
+            onClick={() => setActiveView("profile")}
+          >
+            Profile
+          </button>
+        </nav>
         <div className="topbar-account">
           <span className="topbar-greeting">Hi, {user.name.split(" ")[0]}</span>
           <button className="button button-outline signout-button" onClick={onSignOut}>
@@ -171,6 +485,244 @@ function NeighborhoodDashboard({ user, onSignOut }) {
         </div>
       </section>
 
+      {activeView === "profile" ? (
+        <section className="profile-settings-page" aria-labelledby="profile-settings-heading">
+          <header className="profile-settings-heading">
+            <p className="eyebrow">Your account</p>
+            <h2 id="profile-settings-heading">Profile & settings</h2>
+            <p>Manage your profile photo, password, and who can see your information.</p>
+          </header>
+          <div className="profile-settings-grid">
+            <section className="profile-settings-card photo-settings-card" aria-labelledby="photo-heading">
+              <div>
+                <p className="eyebrow">Your profile</p>
+                <h3 id="photo-heading">Profile photo</h3>
+                <p className="profile-settings-copy">Use a clear photo so your neighbors can recognize you.</p>
+              </div>
+              <div className="profile-photo-preview">
+                <ProfileAvatar profile={user} className="profile-photo-large" />
+                <div>
+                  <strong>{user.name}</strong>
+                  <span>JPG, PNG, or WebP · up to 2 MB</span>
+                </div>
+              </div>
+              <form className="photo-upload-form" onSubmit={saveProfilePhoto}>
+                <label className="profile-file-label" htmlFor="profile-photo-file">Choose a photo</label>
+                <input
+                  id="profile-photo-file"
+                  name="photo"
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  required
+                />
+                <button className="button button-primary profile-action-button" type="submit" disabled={photoUploading}>
+                  {photoUploading ? "Uploading…" : "Upload photo"}
+                </button>
+                {user.profilePhotoUrl && (
+                  <button
+                    className="button button-outline profile-action-button"
+                    type="button"
+                    onClick={removeProfilePhoto}
+                    disabled={photoUploading}
+                  >
+                    Remove photo
+                  </button>
+                )}
+              </form>
+            </section>
+
+            <section className="profile-settings-card password-settings-card" aria-labelledby="password-heading">
+              <div>
+                <p className="eyebrow">Account security</p>
+                <h3 id="password-heading">Change password</h3>
+                <p className="profile-settings-copy">Choose a new password you don’t use elsewhere.</p>
+              </div>
+              <form className="password-form" onSubmit={changePassword}>
+                <label>
+                  Current password
+                  <input
+                    type="password"
+                    autoComplete="current-password"
+                    value={passwordForm.currentPassword}
+                    onChange={(event) => setPasswordForm((current) => ({ ...current, currentPassword: event.target.value }))}
+                    required
+                  />
+                </label>
+                <label>
+                  New password
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    minLength="8"
+                    maxLength="72"
+                    value={passwordForm.newPassword}
+                    onChange={(event) => setPasswordForm((current) => ({ ...current, newPassword: event.target.value }))}
+                    required
+                  />
+                </label>
+                <label>
+                  Confirm new password
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    minLength="8"
+                    maxLength="72"
+                    value={passwordForm.confirmPassword}
+                    onChange={(event) => setPasswordForm((current) => ({ ...current, confirmPassword: event.target.value }))}
+                    required
+                  />
+                </label>
+                <button className="button button-primary profile-action-button" type="submit" disabled={savingPassword}>
+                  {savingPassword ? "Saving…" : "Update password"}
+                </button>
+              </form>
+            </section>
+          </div>
+
+          <section className="profile-settings-card profile-privacy-card" aria-labelledby="privacy-heading">
+            <div>
+              <p className="eyebrow">Profile privacy</p>
+              <h3 id="privacy-heading">Choose who can see your profile</h3>
+              <p className="profile-settings-copy">
+                Your interests, designation, and workplace stay searchable so neighbors can find common ground.
+              </p>
+            </div>
+            <div className="privacy-options" role="radiogroup" aria-label="Profile visibility">
+            {[
+              {
+                value: "public",
+                title: "Public",
+                description: "People in your area can see your photo, name, address, interests, and work details.",
+              },
+              {
+                value: "private",
+                title: "Private",
+                description: "Your name, address, and photo are hidden. People can still find you by interests, designation, or workplace.",
+              },
+              {
+                value: "connections",
+                title: "Connections only",
+                description: "Your name, address, and photo are hidden until you accept a connection request. Connected neighbors can see your full profile.",
+              },
+            ].map((option) => (
+              <label
+                className={`privacy-option${visibility === option.value ? " selected" : ""}`}
+                key={option.value}
+              >
+                <input
+                  type="radio"
+                  name="profile-visibility"
+                  value={option.value}
+                  checked={visibility === option.value}
+                  disabled={savingVisibility}
+                  onChange={() => updateVisibility(option.value)}
+                />
+                <span className="privacy-option-copy">
+                  <strong>{option.title}</strong>
+                  <span>{option.description}</span>
+                </span>
+                <span className="privacy-option-check" aria-hidden="true">
+                  {visibility === option.value ? "✓" : ""}
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="privacy-note">
+            You can still chat and send or accept connection requests when your profile is private.
+          </p>
+          </section>
+          {(savingVisibility || photoUploading || savingPassword) && (
+            <p className="privacy-status" role="status">Saving your profile settings…</p>
+          )}
+          {profileStatus && <p className="profile-feedback success" role="status">{profileStatus}</p>}
+          {profileError && <p className="chat-error" role="alert">{profileError}</p>}
+        </section>
+      ) : activeView === "connections" ? (
+        <section className="connections-page" aria-label="Find and connect with people nearby">
+          <header className="connections-heading">
+            <div>
+              <p className="eyebrow">Community connections</p>
+              <h2>Meet someone nearby</h2>
+              <p>Search by name or interest, then send a connection request.</p>
+            </div>
+            <label className="connections-search">
+              <span aria-hidden="true">⌕</span>
+              <input
+                type="search"
+                placeholder="Search by name or interest"
+                value={connectionSearch}
+                onChange={(event) => setConnectionSearch(event.target.value)}
+                aria-label="Search people to connect with"
+              />
+            </label>
+          </header>
+          {loadingConnections ? (
+            <div className="connections-empty">
+              <span aria-hidden="true">⌕</span>
+              <h3>Finding people nearby…</h3>
+            </div>
+          ) : filteredConnectionPeople.length === 0 ? (
+            <div className="connections-empty">
+              <span aria-hidden="true">⌕</span>
+              <h3>No people match your search.</h3>
+              <p>Try another name or interest.</p>
+            </div>
+          ) : (
+            <div className="connection-grid">
+              {filteredConnectionPeople.map((person) => (
+                <article className="connection-card" key={person.id}>
+                  <div className="connection-card-person">
+                    <ProfileAvatar
+                      profile={person}
+                      className="connection-card-avatar"
+                      blurred={!person.nameVisible}
+                    />
+                    <div>
+                      <h3 className={person.nameVisible ? "" : "identity-blurred"} aria-label={person.nameVisible ? undefined : "Private profile"}>
+                        {person.name}
+                      </h3>
+                      <p>{[person.job, person.workplace].filter(Boolean).join(" · ") || "Community member"}</p>
+                    </div>
+                  </div>
+                  {person.address && <p className="connection-address">{person.address}</p>}
+                  {person.interests?.length > 0 && (
+                    <div className="interest-list">
+                      {person.interests.slice(0, 5).map((interest) => (
+                        <span className="interest-chip" key={interest}>{interest}</span>
+                      ))}
+                    </div>
+                  )}
+                  {person.connectionStatus === "connected" ? (
+                    <button className="button connection-button connected" type="button" disabled>
+                      Connected ✓
+                    </button>
+                  ) : person.connectionStatus === "incoming" ? (
+                    <button
+                      className="button button-primary connection-button"
+                      type="button"
+                      onClick={() => updateConnection(person, "accept")}
+                    >
+                      Accept request
+                    </button>
+                  ) : person.connectionStatus === "sent" ? (
+                    <button className="button connection-button pending" type="button" disabled>
+                      Request sent
+                    </button>
+                  ) : (
+                    <button
+                      className="button button-primary connection-button"
+                      type="button"
+                      onClick={() => updateConnection(person, "request")}
+                    >
+                      Connect
+                    </button>
+                  )}
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      ) : (
       <section className="community-layout" aria-label="Neighborhood people and messages">
         <aside className="people-panel">
           <div className="people-panel-heading">
@@ -180,21 +732,21 @@ function NeighborhoodDashboard({ user, onSignOut }) {
             </div>
             <span className="people-count">{people.length}</span>
           </div>
-          {people.length > 0 && (
-            <label className="people-search">
-              <span aria-hidden="true">⌕</span>
-              <input
-                type="search"
-                placeholder="Search neighbors"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                aria-label="Search neighbors"
-              />
-            </label>
-          )}
+          <label className="people-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              type="search"
+              placeholder="Search name, interest, or work"
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              aria-label="Search neighbors by name, interest, or work"
+            />
+          </label>
           <div className="people-list">
             {loadingPeople ? (
               <p className="people-empty">Finding people in your area…</p>
+            ) : search.trim() && people.length === 0 ? (
+              <p className="people-empty">No neighbors match that search.</p>
             ) : people.length === 0 ? (
               <div className="people-empty">
                 <span className="empty-illustration" aria-hidden="true">⌂</span>
@@ -221,9 +773,15 @@ function NeighborhoodDashboard({ user, onSignOut }) {
                     type="button"
                     aria-pressed={selectedPerson?.id === person.id}
                   >
-                    <span className="avatar person-avatar">{person.name.charAt(0).toUpperCase()}</span>
+                    <ProfileAvatar
+                      profile={person}
+                      className="person-avatar"
+                      blurred={!person.nameVisible}
+                    />
                     <span className="person-summary">
-                      <span className="person-name">{person.name}</span>
+                      <span className={`person-name${person.nameVisible ? "" : " identity-blurred"}`} aria-label={person.nameVisible ? undefined : "Private profile"}>
+                        {person.name}
+                      </span>
                       <span className="person-detail">{person.job || person.workplace || "Community member"}</span>
                     </span>
                     {latest && <span className="person-message-dot" aria-label="Conversation has messages" />}
@@ -233,7 +791,7 @@ function NeighborhoodDashboard({ user, onSignOut }) {
             )}
           </div>
           <div className="my-profile-mini">
-            <span className="avatar mini-avatar">{user.name.charAt(0).toUpperCase()}</span>
+            <ProfileAvatar profile={user} className="mini-avatar" />
             <span>
               <strong>{user.name}</strong>
               <span>Your neighborhood profile</span>
@@ -257,12 +815,17 @@ function NeighborhoodDashboard({ user, onSignOut }) {
           ) : (
             <>
               <header className="conversation-header">
-                <span className="avatar conversation-avatar">
-                  {selectedPerson.name.charAt(0).toUpperCase()}
-                </span>
+                <ProfileAvatar
+                  profile={selectedPerson}
+                  className="conversation-avatar"
+                  blurred={!selectedPerson.nameVisible}
+                />
                 <span className="conversation-person">
-                  <strong>{selectedPerson.name}</strong>
+                  <strong className={selectedPerson.nameVisible ? "" : "identity-blurred"} aria-label={selectedPerson.nameVisible ? undefined : "Private profile"}>
+                    {selectedPerson.name}
+                  </strong>
                   <span>{[selectedPerson.job, selectedPerson.workplace].filter(Boolean).join(" · ") || "Your neighbor"}</span>
+                  {selectedPerson.address && <span>{selectedPerson.address}</span>}
                 </span>
                 <span className="area-member-badge">Same area</span>
               </header>
@@ -289,7 +852,11 @@ function NeighborhoodDashboard({ user, onSignOut }) {
                   return (
                     <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}>
                       {!ownMessage && (
-                        <span className="avatar message-avatar">{selectedPerson.name.charAt(0).toUpperCase()}</span>
+                        <ProfileAvatar
+                          profile={selectedPerson}
+                          className="message-avatar"
+                          blurred={!selectedPerson.nameVisible}
+                        />
                       )}
                       <div className="message-content">
                         <span className="message-sender">{ownMessage ? "You" : selectedPerson.name}</span>
@@ -332,6 +899,7 @@ function NeighborhoodDashboard({ user, onSignOut }) {
           {chatError && !selectedPerson && <p className="chat-error dashboard-error" role="alert">{chatError}</p>}
         </section>
       </section>
+      )}
     </main>
   );
 }
@@ -455,7 +1023,7 @@ function App() {
   }
 
   if (user) {
-    return <NeighborhoodDashboard user={user} onSignOut={signOut} />;
+    return <NeighborhoodDashboard user={user} onSignOut={signOut} onUserUpdated={setUser} />;
   }
 
   const isSignup = mode === "signup";
