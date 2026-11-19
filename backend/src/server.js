@@ -10,9 +10,16 @@ import { initializeMessageStore } from "./models/ChatMessage.js";
 import { findUserById } from "./models/User.js";
 import { createMessage } from "./models/ChatMessage.js";
 import { initializeConnectionStore } from "./models/Connection.js";
+import { findBusinessById, initializeBusinessStore } from "./models/Business.js";
+import {
+  createBusinessMessage,
+  initializeBusinessMessageStore,
+  listBusinessConversation,
+} from "./models/BusinessMessage.js";
 import authRouter from "./routes/auth.js";
 import locationRouter from "./routes/location.js";
 import neighborhoodRouter from "./routes/neighborhood.js";
+import businessRouter from "./routes/business.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -38,19 +45,38 @@ app.get("/api/health", (_request, response) => {
 app.use("/api/auth", authRouter);
 app.use("/api/location", locationRouter);
 app.use("/api/neighborhood", neighborhoodRouter);
+app.use("/api/business", businessRouter);
 
 function conversationRoom(firstUserId, secondUserId) {
   return `conversation:${[firstUserId, secondUserId].sort().join(":")}`;
 }
 
-function parseSessionCookie(cookieHeader) {
+function parseCookies(cookieHeader) {
   const cookies = Object.fromEntries(
     (cookieHeader || "")
       .split(";")
       .map((part) => part.trim().split("="))
       .filter(([name, value]) => name && value),
   );
-  return cookies.session ? decodeURIComponent(cookies.session) : null;
+  return Object.fromEntries(
+    Object.entries(cookies).map(([name, value]) => [name, decodeURIComponent(value)]),
+  );
+}
+
+async function getBusinessChatPair(userId, businessId) {
+  if (!userId || !businessId) return null;
+  const [currentUser, business] = await Promise.all([
+    findUserById(userId),
+    findBusinessById(businessId),
+  ]);
+  if (
+    !currentUser ||
+    !business ||
+    (currentUser.pincode || "").trim().toUpperCase() !== (business.pincode || "").trim().toUpperCase()
+  ) {
+    return null;
+  }
+  return { currentUser, business };
 }
 
 async function getSameAreaPair(currentUserId, recipientId) {
@@ -70,14 +96,16 @@ async function getSameAreaPair(currentUserId, recipientId) {
 }
 
 io.use((socket, next) => {
-  const token = parseSessionCookie(socket.handshake.headers.cookie);
+  const cookies = parseCookies(socket.handshake.headers.cookie);
+  const token = cookies.business_session || cookies.session;
   if (!token) return next(new Error("Authentication required"));
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     if (typeof payload === "string" || typeof payload.sub !== "string") {
       return next(new Error("Invalid session"));
     }
-    socket.userId = payload.sub;
+    socket.accountType = payload.accountType === "business" ? "business" : "user";
+    socket.accountId = payload.sub;
     return next();
   } catch {
     return next(new Error("Invalid or expired session"));
@@ -85,11 +113,15 @@ io.use((socket, next) => {
 });
 
 io.on("connection", (socket) => {
-  socket.join(`user:${socket.userId}`);
+  socket.join(`${socket.accountType}:${socket.accountId}`);
 
   socket.on("chat:join", async (recipientId, acknowledge = () => {}) => {
     try {
-      const pair = await getSameAreaPair(socket.userId, recipientId);
+      if (socket.accountType !== "user") {
+        acknowledge({ ok: false, error: "Personal chat requires a neighborhood account." });
+        return;
+      }
+      const pair = await getSameAreaPair(socket.accountId, recipientId);
       if (!pair) {
         acknowledge({ ok: false, error: "That neighbor isn’t available in your area." });
         return;
@@ -107,6 +139,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("chat:send", async ({ recipientId, content }, acknowledge = () => {}) => {
+    if (socket.accountType !== "user") {
+      acknowledge({ ok: false, error: "Personal chat requires a neighborhood account." });
+      return;
+    }
     const trimmedContent = typeof content === "string" ? content.trim() : "";
     if (!trimmedContent || trimmedContent.length > 2000) {
       acknowledge({ ok: false, error: "Messages must be between 1 and 2,000 characters." });
@@ -114,7 +150,7 @@ io.on("connection", (socket) => {
     }
 
     try {
-      const pair = await getSameAreaPair(socket.userId, recipientId);
+      const pair = await getSameAreaPair(socket.accountId, recipientId);
       if (!pair) {
         acknowledge({ ok: false, error: "That neighbor isn’t available in your area." });
         return;
@@ -138,6 +174,92 @@ io.on("connection", (socket) => {
       acknowledge({ ok: false, error: "Could not send the message." });
     }
   });
+
+  socket.on("business-chat:join", async (otherAccountId, acknowledge = () => {}) => {
+    try {
+      const pair =
+        socket.accountType === "user"
+          ? await getBusinessChatPair(socket.accountId, otherAccountId)
+          : await getBusinessChatPair(otherAccountId, socket.accountId);
+      if (!pair) {
+        acknowledge({ ok: false, error: "That business isn’t available for chat." });
+        return;
+      }
+      if (socket.accountType === "user" && pair.business.isVisible === false) {
+        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
+        if (existingMessages.length === 0) {
+          acknowledge({ ok: false, error: "That business isn’t available for chat." });
+          return;
+        }
+      }
+      if (socket.accountType === "business") {
+        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
+        if (existingMessages.length === 0) {
+          acknowledge({ ok: false, error: "The customer must start the conversation before you can reply." });
+          return;
+        }
+      }
+      const room = `business-conversation:${pair.currentUser.id}:${pair.business.id}`;
+      await socket.join(room);
+      acknowledge({ ok: true, room });
+    } catch {
+      acknowledge({ ok: false, error: "Could not join the business conversation." });
+    }
+  });
+
+  socket.on("business-chat:send", async ({ otherAccountId, content }, acknowledge = () => {}) => {
+    const trimmedContent = typeof content === "string" ? content.trim() : "";
+    if (!trimmedContent || trimmedContent.length > 2000) {
+      acknowledge({ ok: false, error: "Messages must be between 1 and 2,000 characters." });
+      return;
+    }
+    try {
+      const pair =
+        socket.accountType === "user"
+          ? await getBusinessChatPair(socket.accountId, otherAccountId)
+          : await getBusinessChatPair(otherAccountId, socket.accountId);
+      if (!pair) {
+        acknowledge({ ok: false, error: "That business conversation isn’t available." });
+        return;
+      }
+      if (socket.accountType === "user" && pair.business.isVisible === false) {
+        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
+        if (existingMessages.length === 0) {
+          acknowledge({ ok: false, error: "This business is not currently accepting new chats." });
+          return;
+        }
+        if (
+          socket.accountType === "business" &&
+          (await listBusinessConversation(pair.currentUser.id, pair.business.id)).length === 0
+        ) {
+          acknowledge({ ok: false, error: "The customer must start the conversation before you can reply." });
+          return;
+        }
+      }
+      const message = await createBusinessMessage({
+        userId: pair.currentUser.id,
+        businessId: pair.business.id,
+        senderType: socket.accountType,
+        content: trimmedContent,
+      });
+      const publicMessage = {
+        id: message.id,
+        userId: message.userId,
+        businessId: message.businessId,
+        senderType: message.senderType,
+        content: message.content,
+        createdAt: message.createdAt,
+      };
+      io
+        .to(`business-conversation:${pair.currentUser.id}:${pair.business.id}`)
+        .to(`user:${pair.currentUser.id}`)
+        .to(`business:${pair.business.id}`)
+        .emit("business-chat:message", publicMessage);
+      acknowledge({ ok: true, message: publicMessage });
+    } catch {
+      acknowledge({ ok: false, error: "Could not send the business message." });
+    }
+  });
 });
 
 app.use((error, _request, response, _next) => {
@@ -156,6 +278,8 @@ async function startServer() {
   await initializeUserStore();
   await initializeMessageStore();
   await initializeConnectionStore();
+  await initializeBusinessStore();
+  await initializeBusinessMessageStore();
   console.log("Using local JSON stores at backend/data/.");
 
   httpServer.listen(port, () => {

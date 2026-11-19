@@ -7,9 +7,11 @@ Starter project using React and Express:
 
 For local testing, the backend stores users in `backend/data/users.json` instead of MongoDB. This file is created automatically and ignored by Git.
 
-Signed-in users can browse other profiles sharing their pincode and exchange private one-to-one messages. Messages are stored locally in `backend/data/messages.json`; an open conversation refreshes every four seconds.
+Signed-in users can browse other profiles sharing their pincode and exchange private one-to-one messages in real time. Messages are stored locally in `backend/data/messages.json`.
 
-The starter includes email/password signup and signin, neighborhood profiles, and an optional Geoapify reverse-geocoding lookup for the required pincode. Browser location is requested only after the user chooses **Use my location**. Coordinates are used for that lookup and are not stored. A pincode can always be entered manually.
+The app includes separate email/password signup and signin for neighborhood and business accounts. Business profiles include a category, contact details, address, description, services, opening hours, website, and up to five photos. Businesses can control whether they appear in their area's directory and can reply to customer messages in their separate business inbox. Neighborhood users can discover local businesses, view visible business profiles, and chat with them in a dedicated Business chats section that is separate from personal chats.
+
+Business location permission is requested only after the account holder chooses **Use my location**. If allowed, the business coordinates are saved to that business profile for later location features, and reverse geocoding can fill the pincode. A pincode can always be entered manually. Neighborhood accounts use location only to look up a pincode and do not store coordinates.
 
 ## Requirements
 
@@ -52,6 +54,6 @@ The starter includes email/password signup and signin, neighborhood profiles, an
 
 The frontend proxies `/api` requests to the backend at `http://localhost:5000`.
 
-Signup requires a name, email, password, and pincode. Address, job, school/college/workplace, and interests are optional. Passwords are hashed before storage; the session is kept in an HTTP-only cookie.
+Neighborhood signup requires a name, email, password, and pincode. Address, job, school/college/workplace, and interests are optional. Business signup requires a business name, category, contact name and number, email, password, address, and pincode. Passwords are hashed before storage, and each account type uses an HTTP-only session cookie.
 
-The JSON file store is for single-machine development/testing only. It is not a production database and should not be used by multiple server instances. User and message data are stored locally in the ignored `backend/data/` folder.
+The JSON file store is for single-machine development/testing only. It is not a production database and should not be used by multiple server instances. User, business, connection, personal-message, business-message, and uploaded image data are stored locally in the ignored `backend/data/` folder.

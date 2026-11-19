@@ -12,6 +12,24 @@ const emptyForm = {
   interests: "",
 };
 
+const emptyBusinessForm = {
+  businessName: "",
+  contactName: "",
+  email: "",
+  password: "",
+  phone: "",
+  category: "",
+  pincode: "",
+  address: "",
+  description: "",
+  services: "",
+  openingHours: "",
+  website: "",
+  locationConsent: false,
+  latitude: "",
+  longitude: "",
+};
+
 async function request(path, options = {}) {
   const isFormData = options.body instanceof FormData;
   const response = await fetch(path, {
@@ -49,6 +67,383 @@ function ProfileAvatar({ profile, className = "", blurred = false }) {
   );
 }
 
+function BusinessInbox({ business }) {
+  const [conversations, setConversations] = useState([]);
+  const [selectedUser, setSelectedUser] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const socketRef = useRef(null);
+  const selectedUserRef = useRef(selectedUser);
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    selectedUserRef.current = selectedUser;
+  }, [selectedUser]);
+
+  useEffect(() => {
+    let active = true;
+    request("/api/business/conversations")
+      .then(({ conversations: loaded }) => {
+        if (!active) return;
+        setConversations(loaded);
+        setSelectedUser((current) => current || loaded[0]?.user || null);
+      })
+      .catch((loadError) => setError(loadError.message))
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    const socket = io({ withCredentials: true });
+    socketRef.current = socket;
+    socket.on("business-chat:message", (message) => {
+      if (message.businessId !== business.id) return;
+      setConversations((current) => {
+        const existing = current.find((item) => item.user.id === message.userId);
+        const nextConversation = {
+          user: existing?.user || (selectedUserRef.current?.id === message.userId ? selectedUserRef.current : null),
+          lastMessage: message,
+        };
+        if (!nextConversation.user) return current;
+        return [
+          nextConversation,
+          ...current.filter((item) => item.user.id !== message.userId),
+        ];
+      });
+      request("/api/business/conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
+      if (selectedUserRef.current?.id === message.userId) {
+        setMessages((current) =>
+          current.some((item) => item.id === message.id) ? current : [...current, message],
+        );
+      }
+    });
+    socket.on("connect", () => {
+      const activeUser = selectedUserRef.current;
+      if (activeUser) socket.emit("business-chat:join", activeUser.id);
+    });
+    socket.on("connect_error", () => setError("Live inbox disconnected. Reconnecting…"));
+    return () => {
+      active = false;
+      socket.disconnect();
+      socketRef.current = null;
+    };
+  }, [business.id]);
+
+  useEffect(() => {
+    if (!selectedUser) {
+      setMessages([]);
+      return undefined;
+    }
+    let active = true;
+    setMessages([]);
+    request(`/api/business/conversations/${encodeURIComponent(selectedUser.id)}`)
+      .then(({ messages: loaded }) => {
+        if (active) setMessages(loaded);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      });
+    socketRef.current?.emit("business-chat:join", selectedUser.id, (result) => {
+      if (result?.ok === false) setError(result.error);
+    });
+    return () => {
+      active = false;
+    };
+  }, [selectedUser]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages]);
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || !selectedUser || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      const { message } = await request(
+        `/api/business/conversations/${encodeURIComponent(selectedUser.id)}`,
+        { method: "POST", body: JSON.stringify({ content }) },
+      );
+      setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+      setConversations((current) => {
+        const existing = current.find((item) => item.user.id === selectedUser.id);
+        return [
+          { user: existing?.user || selectedUser, lastMessage: message },
+          ...current.filter((item) => item.user.id !== selectedUser.id),
+        ];
+      });
+      setDraft("");
+    } catch (sendError) {
+      setError(sendError.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <section className="community-layout business-inbox-layout" aria-label="Business customer inbox">
+      <aside className="people-panel">
+        <div className="people-panel-heading">
+          <div><h2>Customer chats</h2><p>{conversations.length} conversations</p></div>
+          <span className="people-count">{conversations.length}</span>
+        </div>
+        <div className="people-list">
+          {loading ? <p className="people-empty">Loading your inbox…</p> : conversations.length === 0 ? (
+            <p className="people-empty">When a neighbor messages your business, the conversation will appear here.</p>
+          ) : conversations.map(({ user, lastMessage }) => (
+            <button
+              className={`person-row${selectedUser?.id === user.id ? " selected" : ""}`}
+              key={user.id}
+              type="button"
+              onClick={() => setSelectedUser(user)}
+            >
+              <span className="avatar person-avatar">{user.name.charAt(0).toUpperCase()}</span>
+              <span className="person-summary">
+                <span className="person-name">{user.name}</span>
+                <span className="person-detail">{lastMessage.content}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <section className="conversation-panel" aria-label="Customer conversation">
+        {!selectedUser ? (
+          <div className="conversation-empty"><h2>Your business inbox</h2><p>Customer conversations will appear here.</p></div>
+        ) : (
+          <>
+            <header className="conversation-header">
+              <span className="avatar conversation-avatar">{selectedUser.name.charAt(0).toUpperCase()}</span>
+              <span className="conversation-person"><strong>{selectedUser.name}</strong><span>Neighborhood customer</span></span>
+            </header>
+            <div className="messages-area" aria-live="polite">
+              {messages.map((message) => {
+                const ownMessage = message.senderType === "business";
+                return (
+                  <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}>
+                    <div className="message-content">
+                      <span className="message-sender">{ownMessage ? business.businessName : selectedUser.name}</span>
+                      <p>{message.content}</p>
+                      <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>
+                    </div>
+                  </div>
+                );
+              })}
+              <div ref={messagesEndRef} />
+            </div>
+            <form className="message-composer" onSubmit={sendMessage}>
+              {error && <p className="chat-error" role="alert">{error}</p>}
+              <label className="sr-only" htmlFor="business-message-draft">Write a reply</label>
+              <textarea
+                id="business-message-draft"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                maxLength={2000}
+                placeholder="Reply to your customer…"
+                rows="2"
+                disabled={sending}
+              />
+              <button className="button button-primary" type="submit" disabled={!draft.trim() || sending}>
+                {sending ? "Sending…" : "Send reply"} <span aria-hidden="true">↗</span>
+              </button>
+            </form>
+          </>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [activeView, setActiveView] = useState("profile");
+  const photoInputRef = useRef(null);
+
+  async function uploadPhotos(event) {
+    event.preventDefault();
+    const files = [...(photoInputRef.current?.files || [])];
+    if (files.length === 0) {
+      setError("Choose at least one photo.");
+      return;
+    }
+    if (files.some((file) => file.size > 4 * 1024 * 1024)) {
+      setError("Each photo must be 4 MB or smaller.");
+      return;
+    }
+    if ((business.photos?.length || 0) + files.length > 5) {
+      setError(`You can add ${Math.max(0, 5 - (business.photos?.length || 0))} more photo(s).`);
+      return;
+    }
+
+    setUploading(true);
+    setError("");
+    setStatus("");
+    try {
+      const upload = new FormData();
+      files.forEach((file) => upload.append("photos", file));
+      const result = await request("/api/business/photos", { method: "POST", body: upload });
+      onBusinessUpdated(result.business);
+      setStatus("Business photos uploaded.");
+      photoInputRef.current.value = "";
+    } catch (uploadError) {
+      setError(uploadError.message);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function removePhoto(fileName) {
+    setError("");
+    setStatus("");
+    try {
+      const result = await request(`/api/business/photos/${encodeURIComponent(fileName)}`, {
+        method: "DELETE",
+      });
+      onBusinessUpdated(result.business);
+      setStatus("Business photo removed.");
+    } catch (removeError) {
+      setError(removeError.message);
+    }
+  }
+
+  async function updateVisibility(isVisible) {
+    setError("");
+    setStatus("");
+    try {
+      const result = await request("/api/business/visibility", {
+        method: "PUT",
+        body: JSON.stringify({ isVisible }),
+      });
+      onBusinessUpdated(result.business);
+      setStatus(isVisible ? "Your business profile is now visible to nearby users." : "Your business profile is hidden from the directory.");
+    } catch (visibilityError) {
+      setError(visibilityError.message);
+    }
+  }
+
+  const location = business.location;
+
+  return (
+    <main className="business-dashboard">
+      <header className="business-topbar">
+        <a className="brand" href="/" aria-label="Commonground home">
+          <span className="brand-mark">c.</span>
+          <span>common<span className="brand-light">ground</span></span>
+        </a>
+        <nav className="topbar-nav" aria-label="Business navigation">
+          <button className={`nav-button${activeView === "profile" ? " active" : ""}`} type="button" onClick={() => setActiveView("profile")}>Profile</button>
+          <button className={`nav-button${activeView === "inbox" ? " active" : ""}`} type="button" onClick={() => setActiveView("inbox")}>Business chats</button>
+        </nav>
+        <div className="business-topbar-actions">
+          <span>Business account</span>
+          <button className="button button-outline" type="button" onClick={onSignOut}>Sign out</button>
+        </div>
+      </header>
+      <section className="business-dashboard-heading">
+        <p className="eyebrow">{activeView === "inbox" ? "Customer support" : "Business profile"}</p>
+        <h1>{business.businessName}</h1>
+        <p>{business.category} · {business.pincode}</p>
+      </section>
+      {activeView === "inbox" ? <BusinessInbox business={business} /> : (
+      <div className="business-dashboard-grid">
+        <section className="business-profile-card">
+          <div className="business-profile-card-heading">
+            <div className="business-mark-large" aria-hidden="true">{business.businessName.charAt(0).toUpperCase()}</div>
+            <div>
+              <span className="business-category-chip">{business.category}</span>
+              <h2>{business.businessName}</h2>
+              <p>Managed by {business.contactName}</p>
+            </div>
+          </div>
+          <div className="business-visibility-control">
+            <div>
+              <strong>Visible to nearby users</strong>
+              <span>{business.isVisible === false ? "Your profile is hidden and cannot receive new chats." : "People in your area can discover your profile and start a chat."}</span>
+            </div>
+            <input
+              type="checkbox"
+              checked={business.isVisible !== false}
+              onChange={(event) => updateVisibility(event.target.checked)}
+              aria-label="Make business profile visible to nearby users"
+            />
+          </div>
+          {business.description && <p className="business-description">{business.description}</p>}
+          <dl className="business-details">
+            <div><dt>Contact</dt><dd>{business.phone}</dd></div>
+            <div><dt>Email</dt><dd>{business.email}</dd></div>
+            <div><dt>Address</dt><dd>{business.address}, {business.pincode}</dd></div>
+            {business.openingHours && <div><dt>Opening hours</dt><dd>{business.openingHours}</dd></div>}
+            {business.website && <div><dt>Website</dt><dd><a href={business.website} target="_blank" rel="noreferrer">{business.website}</a></dd></div>}
+            {location && <div><dt>Saved map location</dt><dd>{location.latitude.toFixed(5)}, {location.longitude.toFixed(5)}</dd></div>}
+          </dl>
+          {business.services?.length > 0 && (
+            <div className="business-services">
+              <h3>Products & services</h3>
+              <div className="interest-list">
+                {business.services.map((service) => <span className="interest-chip" key={service}>{service}</span>)}
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="business-gallery-card">
+          <div className="business-gallery-heading">
+            <div>
+              <p className="eyebrow">Showcase</p>
+              <h2>Business photos</h2>
+              <p>Add up to 5 photos of your shop, products, or work.</p>
+            </div>
+            <span className="people-count">{business.photos?.length || 0}/5</span>
+          </div>
+          {business.photos?.length ? (
+            <div className="business-photo-grid">
+              {business.photos.map((fileName) => (
+                <figure className="business-photo-item" key={fileName}>
+                  <img src={`/api/business/photos/${encodeURIComponent(fileName)}`} alt={`${business.businessName} showcase`} />
+                  <button type="button" aria-label="Remove photo" onClick={() => removePhoto(fileName)}>×</button>
+                </figure>
+              ))}
+            </div>
+          ) : (
+            <div className="business-gallery-empty">
+              <span aria-hidden="true">▧</span>
+              <p>Your business photos will appear here.</p>
+            </div>
+          )}
+          {(business.photos?.length || 0) < 5 && (
+            <form className="business-photo-form" onSubmit={uploadPhotos}>
+              <label htmlFor="business-photos">Choose photos</label>
+              <input
+                id="business-photos"
+                ref={photoInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                multiple
+                required
+              />
+              <span>JPG, PNG, or WebP · 4 MB maximum per photo</span>
+              <button className="button button-primary" type="submit" disabled={uploading}>
+                {uploading ? "Uploading…" : "Upload photos"}
+              </button>
+            </form>
+          )}
+          {status && <p className="profile-feedback success" role="status">{status}</p>}
+          {notice && <p className="form-error" role="alert">{notice}</p>}
+          {error && <p className="form-error" role="alert">{error}</p>}
+        </section>
+      </div>
+      )}
+    </main>
+  );
+}
+
 function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   const [people, setPeople] = useState([]);
   const [connectionPeople, setConnectionPeople] = useState([]);
@@ -71,15 +466,35 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
   const [chatError, setChatError] = useState("");
+  const [businesses, setBusinesses] = useState([]);
+  const [businessSearch, setBusinessSearch] = useState("");
+  const [loadingBusinesses, setLoadingBusinesses] = useState(false);
+  const [businessConversations, setBusinessConversations] = useState([]);
+  const [selectedBusiness, setSelectedBusiness] = useState(null);
+  const [businessMessages, setBusinessMessages] = useState([]);
+  const [businessDraft, setBusinessDraft] = useState("");
+  const [businessChatError, setBusinessChatError] = useState("");
+  const [businessSending, setBusinessSending] = useState(false);
+  const [loadingBusinessMessages, setLoadingBusinessMessages] = useState(false);
   const messagesEndRef = useRef(null);
   const socketRef = useRef(null);
   const selectedPersonRef = useRef(selectedPerson);
+  const selectedBusinessRef = useRef(selectedBusiness);
+  const activeViewRef = useRef(activeView);
   const connectionSearchRef = useRef(connectionSearch);
   const searchRef = useRef(search);
 
   useEffect(() => {
     selectedPersonRef.current = selectedPerson;
   }, [selectedPerson]);
+
+  useEffect(() => {
+    selectedBusinessRef.current = selectedBusiness;
+  }, [selectedBusiness]);
+
+  useEffect(() => {
+    activeViewRef.current = activeView;
+  }, [activeView]);
 
   useEffect(() => {
     connectionSearchRef.current = connectionSearch;
@@ -110,6 +525,23 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
       );
     });
 
+    socket.on("business-chat:message", (message) => {
+      if (message.userId !== user.id) return;
+      if (
+        activeViewRef.current === "businessChats" &&
+        selectedBusinessRef.current?.id === message.businessId
+      ) {
+        setBusinessMessages((current) =>
+          current.some((existing) => existing.id === message.id)
+            ? current
+            : [...current, message],
+        );
+      }
+      request("/api/neighborhood/business-chats")
+        .then((result) => setBusinessConversations(result.conversations))
+        .catch((loadError) => setBusinessChatError(loadError.message));
+    });
+
     const refreshConnections = () => {
       request(`/api/neighborhood/connections?search=${encodeURIComponent(connectionSearchRef.current)}`)
         .then((result) => {
@@ -138,6 +570,8 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
       if (activePerson) {
         socket.emit("chat:join", activePerson.id);
       }
+      const activeBusiness = selectedBusinessRef.current;
+      if (activeBusiness) socket.emit("business-chat:join", activeBusiness.id);
     });
 
     return () => {
@@ -145,6 +579,74 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
       socketRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (activeView !== "businesses") return undefined;
+    let active = true;
+    setLoadingBusinesses(true);
+    const timerId = window.setTimeout(async () => {
+      try {
+        const result = await request(
+          `/api/neighborhood/businesses?search=${encodeURIComponent(businessSearch)}`,
+        );
+        if (active) setBusinesses(result.businesses);
+      } catch (loadError) {
+        if (active) setBusinessChatError(loadError.message);
+      } finally {
+        if (active) setLoadingBusinesses(false);
+      }
+    }, businessSearch ? 220 : 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timerId);
+    };
+  }, [activeView, businessSearch]);
+
+  useEffect(() => {
+    if (activeView !== "businessChats") return undefined;
+    let active = true;
+    request("/api/neighborhood/business-chats")
+      .then(({ conversations }) => {
+        if (!active) return;
+        setBusinessConversations(conversations);
+        setSelectedBusiness((current) =>
+          current || conversations[0]?.business || null,
+        );
+      })
+      .catch((loadError) => {
+        if (active) setBusinessChatError(loadError.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeView]);
+
+  useEffect(() => {
+    if (activeView !== "businessChats" || !selectedBusiness) {
+      setBusinessMessages([]);
+      return undefined;
+    }
+    let active = true;
+    setLoadingBusinessMessages(true);
+    setBusinessChatError("");
+    setBusinessMessages([]);
+    request(`/api/neighborhood/businesses/${encodeURIComponent(selectedBusiness.id)}/messages`)
+      .then(({ messages: loaded }) => {
+        if (active) setBusinessMessages(loaded);
+      })
+      .catch((loadError) => {
+        if (active) setBusinessChatError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoadingBusinessMessages(false);
+      });
+    socketRef.current?.emit("business-chat:join", selectedBusiness.id, (result) => {
+      if (result?.ok === false) setBusinessChatError(result.error);
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeView, selectedBusiness]);
 
   useEffect(() => {
     let active = true;
@@ -293,6 +795,41 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
       setChatError(sendError.message);
     } finally {
       setSending(false);
+    }
+  }
+
+  function openBusinessChat(business) {
+    setSelectedBusiness(business);
+    setBusinessChatError("");
+    setActiveView("businessChats");
+  }
+
+  async function sendBusinessMessage(event) {
+    event.preventDefault();
+    const content = businessDraft.trim();
+    if (!content || !selectedBusiness || businessSending) return;
+    setBusinessSending(true);
+    setBusinessChatError("");
+    try {
+      const { message } = await request(
+        `/api/neighborhood/businesses/${encodeURIComponent(selectedBusiness.id)}/messages`,
+        { method: "POST", body: JSON.stringify({ content }) },
+      );
+      setBusinessMessages((current) =>
+        current.some((existing) => existing.id === message.id) ? current : [...current, message],
+      );
+      setBusinessConversations((current) => [
+        {
+          business: selectedBusiness,
+          lastMessage: message,
+        },
+        ...current.filter((item) => item.business.id !== selectedBusiness.id),
+      ]);
+      setBusinessDraft("");
+    } catch (sendError) {
+      setBusinessChatError(sendError.message);
+    } finally {
+      setBusinessSending(false);
     }
   }
 
@@ -452,6 +989,25 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
             {pendingConnectionCount > 0 && (
               <span className="nav-count" aria-label={`${pendingConnectionCount} pending requests`}>
                 {pendingConnectionCount}
+              </span>
+            )}
+          </button>
+          <button
+            className={`nav-button${activeView === "businesses" ? " active" : ""}`}
+            type="button"
+            onClick={() => setActiveView("businesses")}
+          >
+            Businesses
+          </button>
+          <button
+            className={`nav-button${activeView === "businessChats" ? " active" : ""}`}
+            type="button"
+            onClick={() => setActiveView("businessChats")}
+          >
+            Business chats
+            {businessConversations.length > 0 && (
+              <span className="nav-count" aria-label={`${businessConversations.length} business conversations`}>
+                {businessConversations.length}
               </span>
             )}
           </button>
@@ -667,6 +1223,176 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
               <h3>No people match your search.</h3>
               <p>Try another name or interest.</p>
             </div>
+          ) : activeView === "businesses" ? (
+            <section className="business-directory-page" aria-label="Businesses nearby">
+              <header className="connections-heading">
+                <div>
+                  <p className="eyebrow">Local businesses</p>
+                  <h2>Discover businesses nearby</h2>
+                  <p>Browse businesses in your area and start a separate business chat.</p>
+                </div>
+                <label className="connections-search">
+                  <span aria-hidden="true">⌕</span>
+                  <input
+                    type="search"
+                    placeholder="Search business, category, or service"
+                    value={businessSearch}
+                    onChange={(event) => setBusinessSearch(event.target.value)}
+                    aria-label="Search businesses by name, category, or service"
+                  />
+                </label>
+              </header>
+              {businessChatError && <p className="chat-error" role="alert">{businessChatError}</p>}
+              {loadingBusinesses ? (
+                <div className="connections-empty"><h3>Finding businesses nearby…</h3></div>
+              ) : businesses.length === 0 ? (
+                <div className="connections-empty">
+                  <h3>No businesses found in your area.</h3>
+                  <p>Try a different search, or check back when more businesses join.</p>
+                </div>
+              ) : (
+                <div className="business-directory-grid">
+                  {businesses.map((business) => (
+                    <article className="business-directory-card" key={business.id}>
+                      {business.photos?.length > 0 ? (
+                        <img
+                          className="business-directory-photo"
+                          src={business.photos[0]}
+                          alt={`${business.businessName} preview`}
+                        />
+                      ) : (
+                        <div className="business-directory-placeholder" aria-hidden="true">
+                          {business.businessName.charAt(0).toUpperCase()}
+                        </div>
+                      )}
+                      <div className="business-directory-copy">
+                        <span className="business-category-chip">{business.category}</span>
+                        <h3>{business.businessName}</h3>
+                        <p>{business.description || business.address}</p>
+                        {business.services?.length > 0 && (
+                          <div className="interest-list">
+                            {business.services.slice(0, 4).map((service) => (
+                              <span className="interest-chip" key={service}>{service}</span>
+                            ))}
+                          </div>
+                        )}
+                        <button
+                          className="button button-primary connection-button"
+                          type="button"
+                          onClick={() => openBusinessChat(business)}
+                        >
+                          Message business
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          ) : activeView === "businessChats" ? (
+            <section className="community-layout business-chats-layout" aria-label="Business chats">
+              <aside className="people-panel">
+                <div className="people-panel-heading">
+                  <div><h2>Business chats</h2><p>{businessConversations.length} conversations</p></div>
+                  <span className="people-count">{businessConversations.length}</span>
+                </div>
+                <div className="people-list">
+                  {businessConversations.length === 0 ? (
+                    <div className="people-empty">
+                      <strong>No business chats yet.</strong>
+                      <span>Discover a business nearby to start a conversation.</span>
+                      <button className="button button-outline" type="button" onClick={() => setActiveView("businesses")}>Browse businesses</button>
+                    </div>
+                  ) : businessConversations.map(({ business, lastMessage }) => (
+                    <button
+                      className={`person-row${selectedBusiness?.id === business.id ? " selected" : ""}`}
+                      key={business.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedBusiness(business);
+                        setBusinessChatError("");
+                      }}
+                    >
+                      <span className="avatar person-avatar">{business.businessName.charAt(0).toUpperCase()}</span>
+                      <span className="person-summary">
+                        <span className="person-name">{business.businessName}</span>
+                        <span className="person-detail">{lastMessage.content}</span>
+                      </span>
+                    </button>
+                  ))}
+                  {selectedBusiness && !businessConversations.some((item) => item.business.id === selectedBusiness.id) && (
+                    <button className="person-row selected" type="button">
+                      <span className="avatar person-avatar">{selectedBusiness.businessName.charAt(0).toUpperCase()}</span>
+                      <span className="person-summary"><span className="person-name">{selectedBusiness.businessName}</span><span className="person-detail">New conversation</span></span>
+                    </button>
+                  )}
+                </div>
+              </aside>
+              <section className="conversation-panel" aria-label="Business conversation">
+                {!selectedBusiness ? (
+                  <div className="conversation-empty">
+                    <h2>Your business chats stay separate.</h2>
+                    <p>Choose a business from the list, or discover a nearby business to say hello.</p>
+                  </div>
+                ) : (
+                  <>
+                    <header className="conversation-header">
+                      <span className="avatar conversation-avatar">{selectedBusiness.businessName.charAt(0).toUpperCase()}</span>
+                      <span className="conversation-person">
+                        <strong>{selectedBusiness.businessName}</strong>
+                        <span>{selectedBusiness.category} · {selectedBusiness.pincode}</span>
+                        {selectedBusiness.address && <span>{selectedBusiness.address}</span>}
+                      </span>
+                      <span className="area-member-badge">Local business</span>
+                    </header>
+                    <div className="conversation-profile">
+                      {selectedBusiness.description && <p>{selectedBusiness.description}</p>}
+                      {selectedBusiness.photos?.length > 0 && (
+                        <div className="business-chat-photos">
+                          {selectedBusiness.photos.map((photo) => <img key={photo} src={photo} alt={`${selectedBusiness.businessName} showcase`} />)}
+                        </div>
+                      )}
+                    </div>
+                    <div className="messages-area" aria-live="polite" aria-label="Business messages">
+                      {loadingBusinessMessages && businessMessages.length === 0 ? (
+                        <p className="messages-loading">Opening your business chat…</p>
+                      ) : businessMessages.map((message) => {
+                        const ownMessage = message.senderType === "user";
+                        return (
+                          <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}>
+                            <div className="message-content">
+                              <span className="message-sender">{ownMessage ? "You" : selectedBusiness.businessName}</span>
+                              <p>{message.content}</p>
+                              <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>
+                            </div>
+                          </div>
+                        );
+                      })}
+                      {!loadingBusinessMessages && businessMessages.length === 0 && (
+                        <div className="conversation-start"><span className="conversation-start-mark">c.</span><strong>Start a business conversation.</strong><span>Ask about products, services, or opening hours.</span></div>
+                      )}
+                      <div ref={messagesEndRef} />
+                    </div>
+                    <form className="message-composer" onSubmit={sendBusinessMessage}>
+                      {businessChatError && <p className="chat-error" role="alert">{businessChatError}</p>}
+                      <label className="sr-only" htmlFor="business-chat-draft">Write a business message</label>
+                      <textarea
+                        id="business-chat-draft"
+                        value={businessDraft}
+                        onChange={(event) => setBusinessDraft(event.target.value)}
+                        maxLength={2000}
+                        placeholder={`Message ${selectedBusiness.businessName}…`}
+                        rows="2"
+                        disabled={businessSending}
+                      />
+                      <button className="button button-primary" type="submit" disabled={!businessDraft.trim() || businessSending}>
+                        {businessSending ? "Sending…" : "Send message"} <span aria-hidden="true">↗</span>
+                      </button>
+                    </form>
+                  </>
+                )}
+              </section>
+            </section>
           ) : (
             <div className="connection-grid">
               {filteredConnectionPeople.map((person) => (
@@ -906,18 +1632,34 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
 
 function App() {
   const [mode, setMode] = useState("signup");
+  const [accountType, setAccountType] = useState("neighborhood");
   const [form, setForm] = useState(emptyForm);
+  const [businessForm, setBusinessForm] = useState(emptyBusinessForm);
   const [user, setUser] = useState(null);
+  const [business, setBusiness] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [locationStatus, setLocationStatus] = useState("");
   const [error, setError] = useState("");
+  const [businessPhotoFiles, setBusinessPhotoFiles] = useState([]);
+  const businessPhotoInputRef = useRef(null);
 
   useEffect(() => {
     request("/api/auth/me")
       .then(({ user: currentUser }) => setUser(currentUser))
       .catch((loadError) => {
-        if (loadError.status !== 401) setError(loadError.message);
+        if (loadError.status !== 401) {
+          setError(loadError.message);
+          return;
+        }
+        request("/api/business/me")
+          .then(({ business: currentBusiness }) => {
+            setBusiness(currentBusiness);
+            setAccountType("business");
+          })
+          .catch((businessError) => {
+            if (businessError.status !== 401) setError(businessError.message);
+          });
       })
       .finally(() => setLoading(false));
   }, []);
@@ -932,6 +1674,28 @@ function App() {
     setMode(nextMode);
     setError("");
     setLocationStatus("");
+  }
+
+  function changeAccountType(nextAccountType) {
+    setAccountType(nextAccountType);
+    setError("");
+    setLocationStatus("");
+    setBusinessPhotoFiles([]);
+  }
+
+  function updateBusinessField(event) {
+    const { name, value } = event.target;
+    setBusinessForm((current) => ({ ...current, [name]: value }));
+    if (name === "pincode") setLocationStatus("");
+  }
+
+  function updateCredentialField(event) {
+    const { name, value } = event.target;
+    if (accountType === "business") {
+      setBusinessForm((current) => ({ ...current, [name]: value }));
+    } else {
+      setForm((current) => ({ ...current, [name]: value }));
+    }
   }
 
   function detectLocation() {
@@ -972,13 +1736,105 @@ function App() {
     );
   }
 
+  function detectBusinessLocation() {
+    setError("");
+    setLocationStatus("Waiting for your location permission…");
+    if (!navigator.geolocation) {
+      setLocationStatus("Location is not supported by this browser. Enter your address and pincode instead.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      async ({ coords }) => {
+        setBusinessForm((current) => ({
+          ...current,
+          locationConsent: true,
+          latitude: String(coords.latitude),
+          longitude: String(coords.longitude),
+        }));
+        try {
+          const result = await request(
+            `/api/location/reverse?lat=${encodeURIComponent(coords.latitude)}&lon=${encodeURIComponent(coords.longitude)}`,
+          );
+          setBusinessForm((current) => ({
+            ...current,
+            pincode: result.pincode || current.pincode,
+          }));
+          setLocationStatus(
+            result.pincode
+              ? `Location saved with your business profile. Pincode found: ${result.pincode}.`
+              : "Location saved. Enter your business pincode manually.",
+          );
+        } catch (locationError) {
+          setLocationStatus(`${locationError.message} Your coordinates are still saved with the business profile.`);
+        }
+      },
+      (locationError) => {
+        const messages = {
+          1: "Location permission wasn’t granted. Enter your business address and pincode instead.",
+          2: "Your location couldn’t be determined. Enter your business address and pincode instead.",
+          3: "Location lookup timed out. Enter your business address and pincode instead.",
+        };
+        setLocationStatus(messages[locationError.code] || "Location lookup failed. Enter your business address and pincode instead.");
+      },
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 },
+    );
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
     setError("");
+    if (accountType === "business" && mode === "signup") {
+      if (businessPhotoFiles.length > 5) {
+        setError("Choose no more than 5 business photos.");
+        return;
+      }
+      if (businessPhotoFiles.some((file) => file.size > 4 * 1024 * 1024)) {
+        setError("Each business photo must be 4 MB or smaller.");
+        return;
+      }
+    }
     setSubmitting(true);
 
     try {
-      if (mode === "signup") {
+      if (accountType === "business" && mode === "signup") {
+        const result = await request("/api/business/signup", {
+          method: "POST",
+          body: JSON.stringify({
+            ...businessForm,
+            services: businessForm.services
+              .split(",")
+              .map((service) => service.trim())
+              .filter(Boolean),
+            latitude: businessForm.locationConsent ? Number(businessForm.latitude) : null,
+            longitude: businessForm.locationConsent ? Number(businessForm.longitude) : null,
+          }),
+        });
+        setBusiness(result.business);
+        setBusinessForm((current) => ({ ...current, password: "" }));
+        const files = businessPhotoFiles;
+        if (files.length > 0) {
+          const upload = new FormData();
+          files.forEach((file) => upload.append("photos", file));
+          try {
+            const photoResult = await request("/api/business/photos", {
+              method: "POST",
+              body: upload,
+            });
+            setBusiness(photoResult.business);
+          } catch (photoError) {
+            setError(`Your business account was created, but photo upload failed: ${photoError.message}`);
+          }
+        }
+        setBusinessPhotoFiles([]);
+        if (businessPhotoInputRef.current) businessPhotoInputRef.current.value = "";
+      } else if (accountType === "business") {
+        const result = await request("/api/business/signin", {
+          method: "POST",
+          body: JSON.stringify({ email: businessForm.email, password: businessForm.password }),
+        });
+        setBusinessForm((current) => ({ ...current, password: "" }));
+        setBusiness(result.business);
+      } else if (mode === "signup") {
         const payload = {
           ...form,
           interests: form.interests
@@ -1011,7 +1867,9 @@ function App() {
     try {
       await request("/api/auth/signout", { method: "POST" });
       setUser(null);
+      setBusiness(null);
       setForm(emptyForm);
+      setBusinessForm(emptyBusinessForm);
       setMode("signin");
     } catch (signOutError) {
       setError(signOutError.message);
@@ -1025,8 +1883,28 @@ function App() {
   if (user) {
     return <NeighborhoodDashboard user={user} onSignOut={signOut} onUserUpdated={setUser} />;
   }
+  if (business) {
+    return (
+      <BusinessDashboard
+        business={business}
+        notice={error}
+        onBusinessUpdated={setBusiness}
+        onSignOut={async () => {
+          try {
+            await request("/api/business/signout", { method: "POST" });
+            setBusiness(null);
+            setBusinessForm(emptyBusinessForm);
+            setMode("signin");
+          } catch (signOutError) {
+            setError(signOutError.message);
+          }
+        }}
+      />
+    );
+  }
 
   const isSignup = mode === "signup";
+  const isBusiness = accountType === "business";
 
   return (
     <main className="auth-page">
@@ -1059,10 +1937,42 @@ function App() {
               <span>common<span className="brand-light">ground</span></span>
             </a>
           </div>
-          <p className="eyebrow form-eyebrow">{isSignup ? "Join your neighborhood" : "Welcome back"}</p>
-          <h2>{isSignup ? "Make yourself at home." : "Good to see you again."}</h2>
+          <div className="account-type-switch" role="tablist" aria-label="Account type">
+            <button
+              className={isBusiness ? "account-type-tab active" : "account-type-tab"}
+              type="button"
+              role="tab"
+              aria-selected={isBusiness}
+              onClick={() => changeAccountType("business")}
+            >
+              Business
+            </button>
+            <button
+              className={!isBusiness ? "account-type-tab active" : "account-type-tab"}
+              type="button"
+              role="tab"
+              aria-selected={!isBusiness}
+              onClick={() => changeAccountType("neighborhood")}
+            >
+              Neighborhood
+            </button>
+          </div>
+          <p className="eyebrow form-eyebrow">
+            {isBusiness
+              ? isSignup ? "Create your business profile" : "Business portal"
+              : isSignup ? "Join your neighborhood" : "Welcome back"}
+          </p>
+          <h2>
+            {isBusiness
+              ? isSignup ? "Bring your business closer." : "Welcome back."
+              : isSignup ? "Make yourself at home." : "Good to see you again."}
+          </h2>
           <p className="form-intro">
-            {isSignup
+            {isBusiness
+              ? isSignup
+                ? "Introduce your business to the community and showcase what you offer."
+                : "Sign in to manage your business profile and photos."
+              : isSignup
               ? "Create your profile and meet the people around you."
               : "Sign in to pick up where your neighborhood left off."}
           </p>
@@ -1089,7 +1999,81 @@ function App() {
           </div>
 
           <form className="auth-form" onSubmit={handleSubmit}>
-            {isSignup && (
+            {isBusiness && isSignup ? (
+              <>
+                <div className="field-row">
+                  <div className="field">
+                    <label htmlFor="businessName">Business name <span className="required">*</span></label>
+                    <input id="businessName" name="businessName" autoComplete="organization" maxLength="100" placeholder="Your shop or company" value={businessForm.businessName} onChange={updateBusinessField} required />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="category">Business category <span className="required">*</span></label>
+                    <select id="category" name="category" value={businessForm.category} onChange={updateBusinessField} required>
+                      <option value="">Select a category</option>
+                      {["Food & drink", "Retail", "Health & wellness", "Home services", "Education", "Professional services", "Arts & crafts", "Automotive", "Beauty & personal care", "Other"].map((category) => (
+                        <option key={category} value={category}>{category}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="field-row">
+                  <div className="field">
+                    <label htmlFor="contactName">Contact person <span className="required">*</span></label>
+                    <input id="contactName" name="contactName" autoComplete="name" maxLength="80" placeholder="Your full name" value={businessForm.contactName} onChange={updateBusinessField} required />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="phone">Contact number <span className="required">*</span></label>
+                    <input id="phone" name="phone" type="tel" autoComplete="tel" maxLength="20" placeholder="+1 555 123 4567" value={businessForm.phone} onChange={updateBusinessField} required />
+                  </div>
+                </div>
+                <div className="field">
+                  <label htmlFor="businessAddress">Business address <span className="required">*</span></label>
+                  <input id="businessAddress" name="address" autoComplete="street-address" maxLength="240" placeholder="Street address and neighborhood" value={businessForm.address} onChange={updateBusinessField} required />
+                </div>
+                <div className="field">
+                  <div className="label-line">
+                    <label htmlFor="businessPincode">Area pincode <span className="required">*</span></label>
+                    <button className="location-button" type="button" onClick={detectBusinessLocation}>
+                      <span aria-hidden="true">⌖</span> Use my location
+                    </button>
+                  </div>
+                  <input id="businessPincode" name="pincode" autoComplete="postal-code" maxLength="12" placeholder="Enter your business pincode" value={businessForm.pincode} onChange={updateBusinessField} required />
+                  <span className="field-hint">Location access is optional. Choosing “Use my location” saves coordinates with your business profile for later location-based features.</span>
+                  {locationStatus && <span className="inline-status" role="status">{locationStatus}</span>}
+                </div>
+                <div className="field">
+                  <label htmlFor="description">About the business <span className="optional">Optional</span></label>
+                  <textarea id="description" name="description" rows="3" maxLength="2000" placeholder="Tell people what makes your business special…" value={businessForm.description} onChange={updateBusinessField} />
+                </div>
+                <div className="field-row">
+                  <div className="field">
+                    <label htmlFor="services">Products or services <span className="optional">Optional</span></label>
+                    <input id="services" name="services" maxLength="1000" placeholder="Fresh bread, catering, repairs…" value={businessForm.services} onChange={updateBusinessField} />
+                    <span className="field-hint">Separate items with commas.</span>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="openingHours">Opening hours <span className="optional">Optional</span></label>
+                    <input id="openingHours" name="openingHours" maxLength="300" placeholder="Mon–Fri, 9 AM–6 PM" value={businessForm.openingHours} onChange={updateBusinessField} />
+                  </div>
+                </div>
+                <div className="field">
+                  <label htmlFor="website">Website <span className="optional">Optional</span></label>
+                  <input id="website" name="website" type="url" maxLength="200" placeholder="https://example.com" value={businessForm.website} onChange={updateBusinessField} />
+                </div>
+                <div className="field">
+                  <label htmlFor="businessPhotos">Business photos <span className="optional">Optional · up to 5</span></label>
+                  <input
+                    id="businessPhotos"
+                    ref={businessPhotoInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    multiple
+                    onChange={(event) => setBusinessPhotoFiles([...event.target.files])}
+                  />
+                  <span className="field-hint">JPG, PNG, or WebP, up to 4 MB each. Add shop, product, or portfolio photos.</span>
+                </div>
+              </>
+            ) : !isBusiness && isSignup ? (
               <>
                 <div className="field">
                   <label htmlFor="name">Your name <span className="required">*</span></label>
@@ -1126,20 +2110,26 @@ function App() {
                   {locationStatus && <span className="inline-status" role="status">{locationStatus}</span>}
                 </div>
               </>
-            )}
+            ) : null}
             <div className="field">
-              <label htmlFor="email">Email address <span className="required">*</span></label>
-              <input id="email" name="email" type="email" autoComplete="email" maxLength="254" placeholder="you@example.com" value={form.email} onChange={updateField} required />
+              <label htmlFor="email">{isBusiness ? "Business email" : "Email address"} <span className="required">*</span></label>
+              <input id="email" name="email" type="email" autoComplete="email" maxLength="254" placeholder={isBusiness ? "business@example.com" : "you@example.com"} value={isBusiness ? businessForm.email : form.email} onChange={updateCredentialField} required />
             </div>
             <div className="field">
-              <label htmlFor="password">Password <span className="required">*</span></label>
-              <input id="password" name="password" type="password" autoComplete={isSignup ? "new-password" : "current-password"} minLength={isSignup ? 8 : undefined} maxLength="72" placeholder={isSignup ? "At least 8 characters" : "Your password"} value={form.password} onChange={updateField} required />
+              <label htmlFor="password">{isBusiness ? "Business password" : "Password"} <span className="required">*</span></label>
+              <input id="password" name="password" type="password" autoComplete={isSignup ? "new-password" : "current-password"} minLength={isSignup ? 8 : undefined} maxLength="72" placeholder={isSignup ? "At least 8 characters" : "Your password"} value={isBusiness ? businessForm.password : form.password} onChange={updateCredentialField} required />
               {isSignup && <span className="field-hint">Use at least 8 characters.</span>}
             </div>
 
             {error && <p className="form-error" role="alert">{error}</p>}
 
-            {isSignup && (
+            {isSignup && isBusiness && (
+              <p className="privacy-note">
+                Location is optional. If you choose “Use my location,” your coordinates will be saved with your business profile. You can enter the address manually instead.
+              </p>
+            )}
+
+            {isSignup && !isBusiness && (
               <p className="privacy-note">
                 Location access is optional. If you allow it, we use it once to find your pincode; your coordinates are not stored.
               </p>
@@ -1152,7 +2142,9 @@ function App() {
           </form>
 
           <p className="switch-copy">
-            {isSignup ? "Already part of the neighborhood?" : "New around here?"}{" "}
+            {isBusiness
+              ? isSignup ? "Already have a business account?" : "New to the business portal?"
+              : isSignup ? "Already part of the neighborhood?" : "New around here?"}{" "}
             <button type="button" onClick={() => changeMode(isSignup ? "signin" : "signup")}>
               {isSignup ? "Sign in" : "Create an account"}
             </button>

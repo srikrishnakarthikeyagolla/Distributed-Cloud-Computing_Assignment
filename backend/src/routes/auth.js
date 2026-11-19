@@ -165,6 +165,12 @@ router.post("/signup", authRateLimit, async (request, response, next) => {
       interests,
       visibility: "connections",
     });
+    response.clearCookie("business_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
     setSessionCookie(response, user.id);
     return response.status(201).json({ user: publicUser(user) });
   } catch (error) {
@@ -186,6 +192,12 @@ router.post("/signin", authRateLimit, async (request, response, next) => {
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return response.status(401).json({ error: "Email or password is incorrect." });
     }
+    response.clearCookie("business_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
     setSessionCookie(response, user.id);
     return response.json({ user: publicUser(user) });
   } catch (error) {
