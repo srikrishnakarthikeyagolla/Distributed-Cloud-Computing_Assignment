@@ -14,6 +14,13 @@ import {
   updateBusinessVisibility,
   updateBusinessPhotos,
 } from "../models/Business.js";
+import {
+  createBusinessProduct,
+  deleteBusinessProduct,
+  findBusinessProduct,
+  listBusinessProducts,
+  updateBusinessProduct,
+} from "../models/BusinessProduct.js";
 import { findUserById } from "../models/User.js";
 import {
   createBusinessMessage,
@@ -28,12 +35,14 @@ import {
   listBusinessDealsForBusiness,
   updateBusinessDealStatus,
 } from "../models/BusinessDeal.js";
+import { listBusinessReviews } from "../models/BusinessReview.js";
 import { requireBusinessAuth } from "../middleware/requireBusinessAuth.js";
 
 const router = Router();
 const passwordPattern = /^[^\s]{8,72}$/;
 const pincodePattern = /^[\p{L}\p{N}][\p{L}\p{N} -]{1,11}$/u;
 const photoDirectory = fileURLToPath(new URL("../../data/business-photos/", import.meta.url));
+const productPhotoDirectory = fileURLToPath(new URL("../../data/business-product-photos/", import.meta.url));
 const photoTypes = new Map([
   ["image/jpeg", { extension: ".jpg", signature: (buffer) => buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff }],
   ["image/png", { extension: ".png", signature: (buffer) => buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) }],
@@ -76,6 +85,17 @@ const uploadPhotos = multer({
     callback(null, true);
   },
 });
+const uploadProductPhoto = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 4 * 1024 * 1024, files: 1 },
+  fileFilter: (_request, file, callback) => {
+    if (!photoTypes.has(file.mimetype)) {
+      callback(new Error("Upload a JPG, PNG, or WebP product photo."));
+      return;
+    }
+    callback(null, true);
+  },
+});
 
 function publicBusiness(business) {
   const { passwordHash, ...details } = business;
@@ -87,6 +107,125 @@ function photoPath(fileName) {
     throw new Error("Invalid business photo filename.");
   }
   return join(photoDirectory, fileName);
+}
+
+function productPhotoPath(fileName) {
+  if (typeof fileName !== "string" || !/^[0-9a-f-]{36}\.(jpg|png|webp)$/i.test(fileName)) {
+    throw new Error("Invalid product photo filename.");
+  }
+  return join(productPhotoDirectory, fileName);
+}
+
+function handleProductPhotoUpload(request, response, next) {
+  uploadProductPhoto.single("photo")(request, response, (error) => {
+    if (!error) return next();
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      return response.status(413).json({ error: "Product photos must be 4 MB or smaller." });
+    }
+    if (error instanceof multer.MulterError) {
+      return response.status(400).json({ error: "Upload one product photo at a time." });
+    }
+    return response.status(400).json({ error: error.message });
+  });
+}
+
+function validateProduct(input) {
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  const description = typeof input.description === "string" ? input.description.trim() : "";
+  const trackInventory = input.trackInventory === true || input.trackInventory === "true";
+  const discountType = ["none", "ongoing", "timed"].includes(input.discountType)
+    ? input.discountType
+    : "none";
+  const rawPrice = typeof input.price === "string" || typeof input.price === "number"
+    ? String(input.price).trim()
+    : "";
+  const price = Number(rawPrice);
+  if (!name || name.length > 100) return { error: "Enter a product name up to 100 characters." };
+  if (!/^(?:\d{1,8})(?:\.\d{1,2})?$/.test(rawPrice) || !Number.isFinite(price)) {
+    return { error: "Enter a valid price with up to 2 decimal places." };
+  }
+  if (input.trackInventory !== undefined && ![true, false, "true", "false"].includes(input.trackInventory)) {
+    return { error: "Choose whether to track this product's stock." };
+  }
+  const rawStockQuantity = typeof input.stockQuantity === "string" || typeof input.stockQuantity === "number"
+    ? String(input.stockQuantity).trim()
+    : "";
+  const stockQuantity = Number(rawStockQuantity);
+  if (
+    trackInventory &&
+    (!/^\d{1,7}$/.test(rawStockQuantity) || !Number.isInteger(stockQuantity) || stockQuantity > 1_000_000)
+  ) {
+    return { error: "Enter a whole-number stock quantity from 0 to 1,000,000." };
+  }
+  if (description.length > 2000) return { error: "Product descriptions must be 2,000 characters or fewer." };
+  if (!["none", "ongoing", "timed"].includes(input.discountType ?? "none")) {
+    return { error: "Choose a valid discount type." };
+  }
+  if (discountType === "none") {
+    return {
+      value: {
+        name,
+        price: Number(price.toFixed(2)),
+        description,
+        discountType,
+        discountPercent: 0,
+        discountEndsAt: null,
+        trackInventory,
+        stockQuantity: trackInventory ? stockQuantity : null,
+      },
+    };
+  }
+
+  const rawDiscountPercent = typeof input.discountPercent === "string" || typeof input.discountPercent === "number"
+    ? String(input.discountPercent).trim()
+    : "";
+  const discountPercent = Number(rawDiscountPercent);
+  if (!/^\d{1,2}$/.test(rawDiscountPercent) || discountPercent < 1 || discountPercent > 99) {
+    return { error: "Enter a discount from 1% to 99%." };
+  }
+
+  let discountEndsAt = null;
+  if (discountType === "timed") {
+    const timestamp = typeof input.discountEndsAt === "string" ? Date.parse(input.discountEndsAt) : NaN;
+    if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
+      return { error: "Choose a discount end time in the future." };
+    }
+    discountEndsAt = new Date(timestamp).toISOString();
+  }
+  return {
+    value: {
+      name,
+      price: Number(price.toFixed(2)),
+      description,
+      discountType,
+      discountPercent,
+      discountEndsAt,
+      trackInventory,
+      stockQuantity: trackInventory ? stockQuantity : null,
+    },
+  };
+}
+
+async function saveProductPhoto(file) {
+  const metadata = photoTypes.get(file.mimetype);
+  if (!metadata.signature(file.buffer)) throw new Error("The product photo file does not match its image type.");
+  const fileName = `${randomUUID()}${metadata.extension}`;
+  await mkdir(productPhotoDirectory, { recursive: true });
+  await writeFile(productPhotoPath(fileName), file.buffer, { flag: "wx", mode: 0o600 });
+  return fileName;
+}
+
+async function removeProductPhoto(fileName) {
+  if (!fileName) return;
+  await rm(productPhotoPath(fileName), { force: true });
+}
+
+function publicBusinessProduct(product, endpoint = "/api/neighborhood/business-products") {
+  const { businessId, ...details } = product;
+  return {
+    ...details,
+    photoUrl: `${endpoint}/${encodeURIComponent(product.id)}/photo`,
+  };
 }
 
 function setBusinessSession(response, businessId) {
@@ -199,6 +338,18 @@ function validateDealProposal(input) {
   return { proposal };
 }
 
+function summarizeBusinessReviews(reviews) {
+  const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  for (const review of reviews) distribution[review.rating] += 1;
+  return {
+    averageRating: reviews.length
+      ? Number((reviews.reduce((total, review) => total + review.rating, 0) / reviews.length).toFixed(1))
+      : 0,
+    reviewCount: reviews.length,
+    distribution,
+  };
+}
+
 function emitBusinessDealUpdate(request, deal) {
   request.app.get("io")
     ?.to(`business-conversation:${deal.userId}:${deal.businessId}`)
@@ -240,6 +391,12 @@ router.post("/signup", signupLimit, async (request, response, next) => {
       sameSite: "lax",
       path: "/",
     });
+    response.clearCookie("service_provider_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
     setBusinessSession(response, business.id);
     return response.status(201).json({ business: publicBusiness(business) });
   } catch (error) {
@@ -261,6 +418,12 @@ router.post("/signin", signinLimit, async (request, response, next) => {
       return response.status(401).json({ error: "Business email or password is incorrect." });
     }
     response.clearCookie("session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
+    response.clearCookie("service_provider_session", {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
       sameSite: "lax",
@@ -291,6 +454,135 @@ router.put("/visibility", requireBusinessAuth, async (request, response, next) =
     const business = await updateBusinessVisibility(request.businessId, request.body.isVisible);
     if (!business) return response.status(404).json({ error: "Your business account could not be found." });
     return response.json({ business: publicBusiness(business) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/reviews", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const reviews = await listBusinessReviews(request.businessId);
+    const customerReviews = await Promise.all(reviews.map(async (review) => {
+      const customer = await findUserById(review.userId);
+      return {
+        id: review.id,
+        rating: review.rating,
+        comment: review.comment,
+        reviewerName: customer?.name || "Customer",
+        createdAt: review.createdAt,
+        updatedAt: review.updatedAt,
+      };
+    }));
+    return response.json({
+      reviews: customerReviews,
+      ...summarizeBusinessReviews(reviews),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/products", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const products = await listBusinessProducts(request.businessId);
+    return response.json({
+      products: products.map((product) => publicBusinessProduct(product, "/api/business/products")),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/products", requireBusinessAuth, businessPhotoLimit, handleProductPhotoUpload, async (request, response, next) => {
+  const result = validateProduct(request.body ?? {});
+  if (result.error) return response.status(400).json({ error: result.error });
+  if (!request.file) return response.status(400).json({ error: "Choose a product photo." });
+  let photo;
+  try {
+    photo = await saveProductPhoto(request.file);
+    const product = await createBusinessProduct({
+      businessId: request.businessId,
+      ...result.value,
+      photo,
+    });
+    return response.status(201).json({
+      product: publicBusinessProduct(product, "/api/business/products"),
+    });
+  } catch (error) {
+    if (photo) await removeProductPhoto(photo);
+    return next(error);
+  }
+});
+
+router.put("/products/:productId", requireBusinessAuth, businessPhotoLimit, handleProductPhotoUpload, async (request, response, next) => {
+  const result = validateProduct(request.body ?? {});
+  if (result.error) return response.status(400).json({ error: result.error });
+  let photo;
+  let productPersisted = false;
+  try {
+    const existing = await findBusinessProduct(request.params.productId);
+    if (!existing || existing.businessId !== request.businessId) {
+      return response.status(404).json({ error: "That product could not be found." });
+    }
+    if (request.file) photo = await saveProductPhoto(request.file);
+    const update = await updateBusinessProduct(request.params.productId, request.businessId, {
+      ...result.value,
+      ...(photo ? { photo } : {}),
+    });
+    if (!update) {
+      if (photo) await removeProductPhoto(photo);
+      return response.status(404).json({ error: "That product could not be found." });
+    }
+    productPersisted = true;
+    if (photo && update.previousPhoto) await removeProductPhoto(update.previousPhoto);
+    return response.json({
+      product: publicBusinessProduct(update.product, "/api/business/products"),
+    });
+  } catch (error) {
+    if (photo && !productPersisted) await removeProductPhoto(photo);
+    return next(error);
+  }
+});
+
+router.patch("/products/:productId/availability", requireBusinessAuth, async (request, response, next) => {
+  if (typeof request.body?.available !== "boolean") {
+    return response.status(400).json({ error: "Choose whether this product is available." });
+  }
+  try {
+    const update = await updateBusinessProduct(request.params.productId, request.businessId, {
+      available: request.body.available,
+    });
+    if (!update) return response.status(404).json({ error: "That product could not be found." });
+    return response.json({
+      product: publicBusinessProduct(update.product, "/api/business/products"),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.delete("/products/:productId", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const product = await deleteBusinessProduct(request.params.productId, request.businessId);
+    if (!product) return response.status(404).json({ error: "That product could not be found." });
+    await removeProductPhoto(product.photo);
+    return response.json({ message: "Product deleted." });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/products/:productId/photo", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const product = await findBusinessProduct(request.params.productId);
+    if (!product || product.businessId !== request.businessId) {
+      return response.status(404).json({ error: "Product photo not found." });
+    }
+    const photoPathname = productPhotoPath(product.photo);
+    response.type(product.photo.split(".").at(-1));
+    return response.sendFile(photoPathname, (error) => {
+      if (error && !response.headersSent) next(error);
+    });
   } catch (error) {
     return next(error);
   }
@@ -496,12 +788,14 @@ router.post("/conversations/:userId", requireBusinessAuth, businessMessageLimit,
 });
 
 router.post("/signout", (_request, response) => {
-  response.clearCookie("business_session", {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-  });
+  for (const cookieName of ["session", "business_session", "service_provider_session"]) {
+    response.clearCookie(cookieName, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
+  }
   return response.json({ message: "Signed out." });
 });
 

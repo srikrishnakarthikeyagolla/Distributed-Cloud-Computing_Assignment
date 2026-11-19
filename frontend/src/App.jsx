@@ -30,6 +30,23 @@ const emptyBusinessForm = {
   longitude: "",
 };
 
+const emptyServiceProviderForm = {
+  name: "",
+  email: "",
+  password: "",
+  phone: "",
+  pincode: "",
+  services: [],
+  serviceDetails: {},
+  otherService: "",
+  description: "",
+  expertise: "",
+  yearsExperience: "",
+  locationConsent: false,
+  latitude: "",
+  longitude: "",
+};
+
 async function request(path, options = {}) {
   const isFormData = options.body instanceof FormData;
   const response = await fetch(path, {
@@ -48,6 +65,40 @@ async function request(path, options = {}) {
   }
 
   return result;
+}
+
+function isProductDiscountActive(product, now = Date.now()) {
+  if (!Number.isInteger(product.discountPercent) || product.discountPercent < 1) return false;
+  if (product.discountType === "ongoing") return true;
+  return product.discountType === "timed"
+    && Number.isFinite(Date.parse(product.discountEndsAt))
+    && Date.parse(product.discountEndsAt) > now;
+}
+
+function discountedProductPrice(product) {
+  return Math.round(product.price * (100 - product.discountPercent)) / 100;
+}
+
+function localDateTimeValue(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const localDate = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return localDate.toISOString().slice(0, 16);
+}
+
+function DiscountCountdown({ endsAt, now }) {
+  const remaining = Math.max(0, Date.parse(endsAt) - now);
+  if (!Number.isFinite(remaining) || remaining === 0) return <span className="discount-countdown">Offer ended</span>;
+  const totalSeconds = Math.floor(remaining / 1000);
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const seconds = totalSeconds % 60;
+  const timer = days > 0
+    ? `${days}d ${hours}h ${minutes}m`
+    : `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  return <span className="discount-countdown">Offer ends in {timer}</span>;
 }
 
 function ProfileAvatar({ profile, className = "", blurred = false }) {
@@ -295,7 +346,10 @@ function BusinessInbox({ business, initialDealTarget }) {
     setMessages([]);
     request(`/api/business/conversations/${encodeURIComponent(selectedUser.id)}`)
       .then(({ messages: loaded }) => {
-        if (active) setMessages(loaded);
+        if (active) {
+          setMessages(loaded);
+          setServiceName((current) => current || loaded.at(-1)?.serviceName || "");
+        }
       })
       .catch((loadError) => {
         if (active) setError(loadError.message);
@@ -458,6 +512,1349 @@ function BusinessInbox({ business, initialDealTarget }) {
   );
 }
 
+function ServiceCatalogPicker({
+  catalog,
+  selectedServices,
+  onServicesChange,
+  otherService,
+  onOtherServiceChange,
+  search,
+  onSearchChange,
+}) {
+  const filteredServices = catalog.filter((service) => service.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()));
+
+  function toggleService(service) {
+    onServicesChange((current) => current.includes(service)
+      ? current.filter((item) => item !== service)
+      : [...current, service]);
+  }
+
+  return (
+    <div className="service-catalog-picker">
+      <label className="sr-only" htmlFor="service-catalog-search">Search available services</label>
+      <input
+        id="service-catalog-search"
+        type="search"
+        value={search}
+        onChange={(event) => onSearchChange(event.target.value)}
+        placeholder="Search 100+ services…"
+      />
+      <span className="field-hint">Choose one or more services. Select “Other” to add a custom service.</span>
+      <div className="service-catalog-options">
+        {filteredServices.map((service) => (
+          <label key={service} className="service-catalog-option">
+            <input
+              type="checkbox"
+              checked={selectedServices.includes(service)}
+              onChange={() => toggleService(service)}
+            />
+            <span>{service}</span>
+          </label>
+        ))}
+        {filteredServices.length === 0 && <p className="product-catalog-empty">No services match that search.</p>}
+      </div>
+      {selectedServices.some((service) => service.toLocaleLowerCase() === "other") && (
+        <label className="field">
+          Describe your other service
+          <input
+            type="text"
+            value={otherService}
+            onChange={(event) => onOtherServiceChange(event.target.value)}
+            maxLength="80"
+            placeholder="Describe the service you provide"
+            required
+          />
+        </label>
+      )}
+      <div className="selected-service-chips" aria-label="Selected services">
+        {selectedServices.map((service) => (
+          <button type="button" className="interest-chip" key={service} onClick={() => toggleService(service)}>
+            {service} <span aria-hidden="true">×</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ServiceDetailsEditor({ services, serviceDetails, otherService, onDetailsChange }) {
+  function updateService(serviceName, field, value) {
+    onDetailsChange((current) => ({
+      ...current,
+      [serviceName]: {
+        ...(current[serviceName] || {}),
+        [field]: value,
+      },
+    }));
+  }
+
+  if (services.length === 0) return null;
+
+  return (
+    <div className="service-details-editor">
+      <p className="field-hint">Add a short description for every selected service. Usual prices are optional.</p>
+      {services.map((serviceName) => {
+        const label = serviceName === "Other" ? otherService || "Other service" : serviceName;
+        const details = serviceDetails[serviceName] || {};
+        return (
+          <fieldset className="service-details-fieldset" key={serviceName}>
+            <legend>{label}</legend>
+            <label>
+              Service details <span className="required">*</span>
+              <textarea
+                rows="2"
+                maxLength="1000"
+                value={details.description || ""}
+                onChange={(event) => updateService(serviceName, "description", event.target.value)}
+                placeholder={`Describe your ${label.toLocaleLowerCase()} service`}
+                required
+              />
+            </label>
+            <label>
+              Usual price in ₹ <span className="optional">Optional</span>
+              <input
+                type="number"
+                min="0"
+                max="10000000"
+                step="0.01"
+                value={details.usualPrice ?? ""}
+                onChange={(event) => updateService(serviceName, "usualPrice", event.target.value)}
+                placeholder="Leave blank if price varies"
+              />
+            </label>
+          </fieldset>
+        );
+      })}
+    </div>
+  );
+}
+
+function ServicesMarketplace({ user, initialView = "explore" }) {
+  const [activeView, setActiveView] = useState(initialView);
+  const [providers, setProviders] = useState([]);
+  const [conversations, setConversations] = useState([]);
+  const [serviceCatalog, setServiceCatalog] = useState([]);
+  const [search, setSearch] = useState("");
+  const [serviceFilter, setServiceFilter] = useState("");
+  const [serviceSearch, setServiceSearch] = useState("");
+  const [selectedProvider, setSelectedProvider] = useState(null);
+  const [selectedService, setSelectedService] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [mode, setMode] = useState("messages");
+  const [focusedDealId, setFocusedDealId] = useState(null);
+  const [error, setError] = useState("");
+  const [loadingProviders, setLoadingProviders] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [sending, setSending] = useState(false);
+  const messagesEndRef = useRef(null);
+  const visibleProviders = providers.filter((provider) => !serviceFilter
+    || (Array.isArray(provider.services) && provider.services.includes(serviceFilter))
+    || (serviceFilter === "Other" && provider.otherService));
+  const visibleServiceCatalog = serviceCatalog.filter((service) =>
+    service.toLocaleLowerCase().includes(serviceSearch.trim().toLocaleLowerCase()),
+  );
+
+  useEffect(() => {
+    let active = true;
+    request("/api/service-providers/catalog")
+      .then(({ services }) => {
+        if (active) setServiceCatalog(services);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (activeView !== "explore") return undefined;
+    let active = true;
+    setLoadingProviders(true);
+    const timerId = window.setTimeout(() => {
+      request(`/api/service-providers/directory?search=${encodeURIComponent(search)}&service=${encodeURIComponent(serviceFilter)}`)
+        .then(({ serviceProviders: loaded }) => {
+          if (active) setProviders(loaded);
+        })
+        .catch((loadError) => {
+          if (active) setError(loadError.message);
+        })
+        .finally(() => {
+          if (active) setLoadingProviders(false);
+        });
+    }, search ? 220 : 0);
+    return () => {
+      active = false;
+      window.clearTimeout(timerId);
+    };
+  }, [activeView, search, serviceFilter]);
+
+  useEffect(() => {
+    if (activeView !== "chats") return undefined;
+    let active = true;
+    request("/api/service-providers/my-conversations")
+      .then(({ conversations: loaded }) => {
+        if (!active) return;
+        setConversations(loaded);
+        setSelectedProvider((current) => current || loaded[0]?.serviceProvider || null);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeView]);
+
+  useEffect(() => {
+    if (!selectedProvider) {
+      setMessages([]);
+      return undefined;
+    }
+    let active = true;
+    setLoadingMessages(true);
+    request(`/api/service-providers/providers/${encodeURIComponent(selectedProvider.id)}/messages`)
+      .then(({ messages: loaded }) => {
+        if (active) {
+          setMessages(loaded);
+          setSelectedService((current) => {
+            if (current && selectedProvider.services?.includes(current)) return current;
+            return loaded.at(-1)?.serviceName || "";
+          });
+        }
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoadingMessages(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedProvider]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages]);
+
+  useEffect(() => {
+    const socket = io({ withCredentials: true });
+    socket.on("service-chat:message", (message) => {
+      if (message.userId !== user.id) return;
+      if (message.serviceProviderId === selectedProvider?.id && mode === "messages") {
+        setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+      }
+      request("/api/service-providers/my-conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
+    });
+    socket.on("service-deal:update", (deal) => {
+      if (deal.userId !== user.id) return;
+      request("/api/service-providers/my-conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
+    });
+    return () => socket.disconnect();
+  }, [user.id, selectedProvider?.id, mode]);
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || !selectedProvider || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      const { message } = await request(
+        `/api/service-providers/providers/${encodeURIComponent(selectedProvider.id)}/messages`,
+        { method: "POST", body: JSON.stringify({ content, serviceName: selectedService }) },
+      );
+      setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+      setDraft("");
+    } catch (sendError) {
+      setError(sendError.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function openProvider(provider, nextServiceName = "", nextMode = "messages", dealId = null) {
+    if (!provider?.id) {
+      setError("This service provider is no longer available. Refresh the services list and try again.");
+      return;
+    }
+    setSelectedProvider(provider);
+    setSelectedService(nextServiceName);
+    setMode(nextMode);
+    setFocusedDealId(dealId);
+    setError("");
+    setActiveView("chats");
+  }
+
+  return (
+    <section className="services-marketplace" aria-label="Local services">
+      <nav className="business-section-nav" aria-label="Services section">
+        <button type="button" className={activeView === "explore" ? "active" : ""} aria-current={activeView === "explore" ? "page" : undefined} onClick={() => setActiveView("explore")}>Find a service</button>
+        <button type="button" className={activeView === "chats" ? "active" : ""} aria-current={activeView === "chats" ? "page" : undefined} onClick={() => setActiveView("chats")}>
+          Service chats{conversations.length > 0 && <span className="nav-count">{conversations.length}</span>}
+        </button>
+        <button type="button" className={activeView === "deals" ? "active" : ""} aria-current={activeView === "deals" ? "page" : undefined} onClick={() => setActiveView("deals")}>Active deals</button>
+      </nav>
+      {error && <p className="chat-error dashboard-error" role="alert">{error}</p>}
+      {activeView === "explore" ? (
+        <section className="services-directory" aria-label="Service providers in your pincode">
+          <section className="service-discovery" aria-label="Browse available services">
+            <div className="service-discovery-heading">
+              <div><p className="eyebrow">What do you need?</p><h2>Browse local services</h2></div>
+              <label className="service-discovery-search">
+                <span aria-hidden="true">⌕</span>
+                <input type="search" value={serviceSearch} onChange={(event) => setServiceSearch(event.target.value)} placeholder="Search services" aria-label="Search services" />
+              </label>
+            </div>
+            <div className="service-category-grid">
+              {visibleServiceCatalog.slice(0, 20).map((service) => (
+                <button
+                  type="button"
+                  className={`service-category-tile${serviceFilter === service ? " selected" : ""}`}
+                  key={service}
+                  onClick={() => {
+                    setServiceFilter((current) => current === service ? "" : service);
+                    setSearch("");
+                  }}
+                  aria-pressed={serviceFilter === service}
+                >
+                  <span className="service-category-icon" aria-hidden="true">{service.charAt(0)}</span>
+                  <span>{service}</span>
+                </button>
+              ))}
+              {visibleServiceCatalog.length === 0 && <p className="people-empty">No services match that search.</p>}
+            </div>
+          </section>
+          <header className="connections-heading">
+            <div>
+              <p className="eyebrow">Local services · {user.pincode}</p>
+              <h2>Find trusted help nearby</h2>
+              <p>{serviceFilter ? `Showing providers offering ${serviceFilter}.` : "Search local providers by name, service, or expertise."}</p>
+            </div>
+            <div className="service-search-controls">
+              <label className="connections-search">
+                <span aria-hidden="true">⌕</span>
+                <input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="e.g. plumbing, AC repair, tutor" aria-label="Search local service providers" />
+              </label>
+              <label className="sr-only" htmlFor="service-category-filter">Filter by service</label>
+              <select id="service-category-filter" value={serviceFilter} onChange={(event) => setServiceFilter(event.target.value)}>
+                <option value="">All services</option>
+                {serviceCatalog.map((service) => <option value={service} key={service}>{service}</option>)}
+              </select>
+            </div>
+          </header>
+          {loadingProviders ? (
+            <div className="connections-empty"><h3>Finding service providers nearby…</h3></div>
+          ) : visibleProviders.length === 0 ? (
+            <div className="connections-empty">
+              <h3>{search || serviceFilter ? "No providers match those filters." : "No service providers listed in your area yet."}</h3>
+              <p>{search || serviceFilter ? "Try another name, service, or clear the service filter." : "Try again later as local professionals join."}</p>
+            </div>
+          ) : (
+            <div className="service-provider-grid">
+              {visibleProviders.map((provider) => (
+                <article className="service-provider-card" key={provider.id}>
+                  <div className="service-provider-card-heading">
+                    <span className="service-provider-avatar">{provider.name.charAt(0).toUpperCase()}</span>
+                    <div><h3>{provider.name}</h3><span>{provider.yearsExperience == null ? "Local service provider" : `${provider.yearsExperience} years of experience`}</span></div>
+                  </div>
+                  <div className="service-provider-offers">
+                    {(Array.isArray(provider.services) ? provider.services : []).map((service) => {
+                      const details = provider.serviceDetails?.[service] || {};
+                      const serviceLabel = service === "Other" ? provider.otherService || service : service;
+                      return (
+                        <article className={`service-offer-card${serviceFilter === service ? " highlighted" : ""}`} key={service}>
+                          <div className="service-offer-heading">
+                            <strong>{serviceLabel}</strong>
+                            {details.usualPrice != null && <span>Usually ₹{Number(details.usualPrice).toLocaleString("en-IN")}</span>}
+                          </div>
+                          <p>{details.description || provider.description || "Contact this provider for service details."}</p>
+                          <button className="button button-outline" type="button" onClick={() => openProvider(provider, service)}>
+                            Message about {serviceLabel}
+                          </button>
+                          <ServiceReviews
+                            provider={provider}
+                            serviceName={service}
+                            serviceLabel={serviceLabel}
+                          />
+                        </article>
+                      );
+                    })}
+                  </div>
+                  {provider.expertise && <p className="service-provider-expertise"><strong>Expertise</strong> {provider.expertise}</p>}
+                  {provider.description && <p className="service-provider-description">{provider.description}</p>}
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      ) : activeView === "deals" ? (
+        <ActiveDealsView
+          accountType="serviceCustomer"
+          accountId={user.id}
+          onOpenDeal={(deal) => openProvider(deal.provider, deal.serviceName || "", "deals", deal.id)}
+        />
+      ) : (
+        <section className="community-layout service-customer-inbox" aria-label="Service provider messages">
+          <aside className="people-panel">
+            <div className="people-panel-heading"><div><h2>Service chats</h2><p>{conversations.length} conversations</p></div><span className="people-count">{conversations.length}</span></div>
+            <div className="people-list">
+              {conversations.length === 0 ? (
+                <div className="people-empty"><strong>No service chats yet.</strong><span>Find a provider nearby to start a conversation.</span><button className="button button-outline" type="button" onClick={() => setActiveView("explore")}>Find a service</button></div>
+              ) : conversations.map(({ serviceProvider: provider, lastMessage }) => (
+                <button className={`person-row${selectedProvider?.id === provider.id ? " selected" : ""}`} key={provider.id} type="button" onClick={() => { setSelectedProvider(provider); setSelectedService(lastMessage?.serviceName || ""); setMode("messages"); setFocusedDealId(null); }}>
+                  <span className="avatar person-avatar">{provider.name.charAt(0).toUpperCase()}</span>
+                  <span className="person-summary"><span className="person-name">{provider.name}</span><span className="person-detail">{lastMessage?.serviceName ? `${lastMessage.serviceName} · ` : ""}{lastMessage?.content || "Open conversation"}</span></span>
+                </button>
+              ))}
+            </div>
+          </aside>
+          <section className="conversation-panel" aria-label="Service provider conversation">
+            {!selectedProvider ? (
+              <div className="conversation-empty"><h2>Find local help and talk directly.</h2><p>Choose a provider from your service chats or browse the directory.</p><button className="button button-outline" type="button" onClick={() => setActiveView("explore")}>Find a service</button></div>
+            ) : (
+              <>
+                <header className="conversation-header">
+                  <span className="avatar conversation-avatar">{selectedProvider.name.charAt(0).toUpperCase()}</span>
+                  <span className="conversation-person"><strong>{selectedProvider.name}</strong><span>{(Array.isArray(selectedProvider.services) ? selectedProvider.services : []).join(" · ")}</span></span>
+                </header>
+                <label className="service-context-picker">
+                  Service you need
+                  <select value={selectedService} onChange={(event) => setSelectedService(event.target.value)} required>
+                    <option value="">Choose a service…</option>
+                    {(Array.isArray(selectedProvider.services) ? selectedProvider.services : []).map((service) => (
+                      <option key={service} value={service}>{service === "Other" ? selectedProvider.otherService || service : service}</option>
+                    ))}
+                  </select>
+                </label>
+                {selectedService && (
+                  <p className="service-context-summary">
+                    {selectedProvider.serviceDetails?.[selectedService]?.description || "Service conversation"}
+                    {selectedProvider.serviceDetails?.[selectedService]?.usualPrice != null && (
+                      <strong> · Usually ₹{Number(selectedProvider.serviceDetails[selectedService].usualPrice).toLocaleString("en-IN")}</strong>
+                    )}
+                  </p>
+                )}
+                <div className="business-chat-mode-switch" role="tablist" aria-label="Service chat type">
+                  <button type="button" role="tab" aria-selected={mode === "messages"} className={mode === "messages" ? "active" : ""} onClick={() => setMode("messages")}>Messages</button>
+                  <button type="button" role="tab" aria-selected={mode === "deals"} className={mode === "deals" ? "active" : ""} onClick={() => setMode("deals")}>Deals</button>
+                </div>
+                {mode === "deals" ? (
+                  <DealCenter
+                    accountType="serviceCustomer"
+                    userId={user.id}
+                    businessId={selectedProvider.id}
+                    businessName={selectedProvider.name}
+                    focusedDealId={focusedDealId}
+                    serviceName={selectedService}
+                    serviceDisplayName={selectedService === "Other" ? selectedProvider.otherService || "Other" : selectedService}
+                    otherServiceDisplayName={selectedProvider.otherService || "Other"}
+                  />
+                ) : (
+                  <>
+                    <div className="messages-area" aria-live="polite">
+                      {loadingMessages && messages.length === 0 ? <p className="messages-loading">Opening chat…</p> : messages.map((message) => {
+                        const ownMessage = message.senderType === "user";
+                        return <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}><div className="message-content"><span className="message-sender">{ownMessage ? "You" : selectedProvider.name}</span>{message.serviceName && <span className="service-message-tag">{message.serviceName === "Other" ? selectedProvider.otherService || message.serviceName : message.serviceName}</span>}<p>{message.content}</p><time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time></div></div>;
+                      })}
+                      {!loadingMessages && messages.length === 0 && <div className="conversation-start"><strong>Start a conversation with {selectedProvider.name}.</strong><span>Describe the service you need and ask any questions.</span></div>}
+                      <div ref={messagesEndRef} />
+                    </div>
+                    <form className="message-composer" onSubmit={sendMessage}>
+                      <label className="sr-only" htmlFor="service-customer-message">Write a message</label>
+                      <textarea id="service-customer-message" value={draft} onChange={(event) => setDraft(event.target.value)} maxLength="2000" rows="2" placeholder={`Message ${selectedProvider.name}…`} disabled={sending} />
+                      <button className="button button-primary" type="submit" disabled={!draft.trim() || !selectedService || sending}>{sending ? "Sending…" : "Send message"}</button>
+                    </form>
+                  </>
+                )}
+              </>
+            )}
+          </section>
+        </section>
+      )}
+    </section>
+  );
+}
+
+function ServiceProviderInbox({ serviceProvider, initialDealTarget }) {
+  const [conversations, setConversations] = useState([]);
+  const [selectedCustomer, setSelectedCustomer] = useState(initialDealTarget?.customer || null);
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [mode, setMode] = useState(initialDealTarget ? "deals" : "messages");
+  const [focusedDealId, setFocusedDealId] = useState(initialDealTarget?.dealId || null);
+  const [serviceName, setServiceName] = useState(initialDealTarget?.serviceName || "");
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    let active = true;
+    request("/api/service-providers/conversations")
+      .then(({ conversations: loaded }) => {
+        if (active) {
+          setConversations(loaded);
+          if (!initialDealTarget) {
+            setSelectedCustomer((current) => current || loaded[0]?.user || null);
+            setServiceName((current) => current || loaded[0]?.lastMessage?.serviceName || "");
+          }
+        }
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      });
+    const socket = io({ withCredentials: true });
+    socket.on("service-chat:message", (message) => {
+      if (message.serviceProviderId !== serviceProvider.id) return;
+      if (message.userId === selectedCustomer?.id && mode === "messages") {
+        setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+        if (message.senderType === "user" && message.serviceName) setServiceName(message.serviceName);
+      }
+      request("/api/service-providers/conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
+    });
+    socket.on("service-deal:update", (deal) => {
+      if (deal.serviceProviderId !== serviceProvider.id) return;
+      request("/api/service-providers/conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
+    });
+    return () => {
+      active = false;
+      socket.disconnect();
+    };
+  }, [serviceProvider.id, selectedCustomer?.id, mode]);
+
+  useEffect(() => {
+    if (!selectedCustomer) {
+      setMessages([]);
+      return undefined;
+    }
+    let active = true;
+    setLoadingMessages(true);
+    request(`/api/service-providers/conversations/${encodeURIComponent(selectedCustomer.id)}/messages`)
+      .then(({ messages: loaded }) => {
+        if (active) {
+          setMessages(loaded);
+          if (!initialDealTarget) setServiceName(loaded.at(-1)?.serviceName || "");
+        }
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoadingMessages(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedCustomer]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages]);
+
+  async function sendMessage(event) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || !selectedCustomer || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      const { message } = await request(
+        `/api/service-providers/conversations/${encodeURIComponent(selectedCustomer.id)}/messages`,
+        { method: "POST", body: JSON.stringify({ content, serviceName }) },
+      );
+      setMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
+      setDraft("");
+    } catch (sendError) {
+      setError(sendError.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function openDeal(deal) {
+    setSelectedCustomer(deal.customer);
+    setFocusedDealId(deal.id);
+    setServiceName(deal.serviceName || "");
+    setMode("deals");
+  }
+
+  return (
+    <section className="community-layout service-provider-inbox" aria-label="Service customer chats">
+      <aside className="people-panel">
+        <div className="people-panel-heading">
+          <div><h2>Service chats</h2><p>{conversations.length} conversations</p></div>
+          <span className="people-count">{conversations.length}</span>
+        </div>
+        <div className="people-list">
+          {conversations.length === 0 ? (
+            <p className="people-empty">Customer chats and service deals will appear here.</p>
+          ) : conversations.map(({ user, lastMessage }) => (
+            <button
+              className={`person-row${selectedCustomer?.id === user.id ? " selected" : ""}`}
+              key={user.id}
+              type="button"
+              onClick={() => {
+                setSelectedCustomer(user);
+                setServiceName(lastMessage?.serviceName || "");
+                setMode("messages");
+                setError("");
+              }}
+            >
+              <span className="avatar person-avatar">{user.name.charAt(0).toUpperCase()}</span>
+              <span className="person-summary">
+                <span className="person-name">{user.name}</span>
+                <span className="person-detail">{lastMessage?.serviceName ? `${lastMessage.serviceName} · ` : ""}{lastMessage?.content || "Open conversation"}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      </aside>
+      <section className="conversation-panel" aria-label="Service customer conversation">
+        {!selectedCustomer ? (
+          <div className="conversation-empty"><h2>Connect with local customers.</h2><p>Your conversations will appear here.</p></div>
+        ) : (
+          <>
+            <header className="conversation-header">
+              <span className="avatar conversation-avatar">{selectedCustomer.name.charAt(0).toUpperCase()}</span>
+              <span className="conversation-person"><strong>{selectedCustomer.name}</strong><span>Customer in your service area</span></span>
+            </header>
+            <label className="service-context-picker">
+              Service being discussed
+              <select value={serviceName} onChange={(event) => setServiceName(event.target.value)} required>
+                <option value="">Choose a service…</option>
+                {(Array.isArray(serviceProvider.services) ? serviceProvider.services : []).map((service) => (
+                  <option key={service} value={service}>{service === "Other" ? serviceProvider.otherService || service : service}</option>
+                ))}
+              </select>
+            </label>
+            {serviceName && (
+              <p className="service-context-summary">
+                {serviceProvider.serviceDetails?.[serviceName]?.description || "Service conversation"}
+                {serviceProvider.serviceDetails?.[serviceName]?.usualPrice != null && (
+                  <strong> · Usual price ₹{Number(serviceProvider.serviceDetails[serviceName].usualPrice).toLocaleString("en-IN")}</strong>
+                )}
+              </p>
+            )}
+            <div className="business-chat-mode-switch" role="tablist" aria-label="Service conversation type">
+              <button type="button" role="tab" aria-selected={mode === "messages"} className={mode === "messages" ? "active" : ""} onClick={() => setMode("messages")}>Messages</button>
+              <button type="button" role="tab" aria-selected={mode === "deals"} className={mode === "deals" ? "active" : ""} onClick={() => setMode("deals")}>Deals</button>
+            </div>
+            {mode === "deals" ? (
+              <DealCenter
+                accountType="serviceProvider"
+                userId={selectedCustomer.id}
+                businessId={serviceProvider.id}
+                businessName={selectedCustomer.name}
+                focusedDealId={focusedDealId}
+                serviceName={serviceName}
+                serviceDisplayName={serviceName === "Other" ? serviceProvider.otherService || "Other" : serviceName}
+                otherServiceDisplayName={serviceProvider.otherService || "Other"}
+              />
+            ) : (
+              <>
+                <div className="messages-area" aria-live="polite">
+                  {loadingMessages && messages.length === 0 ? <p className="messages-loading">Opening chat…</p> : messages.map((message) => {
+                    const ownMessage = message.senderType === "serviceProvider";
+                    return (
+                      <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}>
+                        <div className="message-content">
+                          <span className="message-sender">{ownMessage ? serviceProvider.name : selectedCustomer.name}</span>
+                          {message.serviceName && <span className="service-message-tag">{message.serviceName === "Other" ? serviceProvider.otherService || message.serviceName : message.serviceName}</span>}
+                          <p>{message.content}</p>
+                          <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {!loadingMessages && messages.length === 0 && <div className="conversation-start"><strong>Start a service conversation.</strong><span>Discuss what the customer needs before proposing a service deal.</span></div>}
+                  <div ref={messagesEndRef} />
+                </div>
+                {error && <p className="chat-error" role="alert">{error}</p>}
+                <form className="message-composer" onSubmit={sendMessage}>
+                  <label className="sr-only" htmlFor="service-provider-message">Write a message</label>
+                  <textarea id="service-provider-message" value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={2000} rows="2" placeholder={`Message ${selectedCustomer.name}…`} disabled={sending} />
+                  <button className="button button-primary" type="submit" disabled={!draft.trim() || !serviceName || sending}>{sending ? "Sending…" : "Send message"}</button>
+                </form>
+              </>
+            )}
+          </>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function ServiceProviderDashboard({ serviceProvider, serviceCatalog, onServiceProviderUpdated, onSignOut }) {
+  const [activeView, setActiveView] = useState("profile");
+  const [dealTarget, setDealTarget] = useState(null);
+  const [name, setName] = useState(serviceProvider.name);
+  const [phone, setPhone] = useState(serviceProvider.phone);
+  const [pincode, setPincode] = useState(serviceProvider.pincode);
+  const [description, setDescription] = useState(serviceProvider.description || "");
+  const [expertise, setExpertise] = useState(serviceProvider.expertise || "");
+  const [yearsExperience, setYearsExperience] = useState(serviceProvider.yearsExperience ?? "");
+  const [selectedServices, setSelectedServices] = useState(serviceProvider.services || []);
+  const [serviceDetails, setServiceDetails] = useState(serviceProvider.serviceDetails || {});
+  const [otherService, setOtherService] = useState(serviceProvider.otherService || "");
+  const [serviceSearch, setServiceSearch] = useState("");
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  async function saveProfile(event) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    setStatus("");
+    try {
+      const { serviceProvider: updated } = await request("/api/service-providers/profile", {
+        method: "PUT",
+        body: JSON.stringify({
+          name,
+          email: serviceProvider.email,
+          phone,
+          pincode,
+          services: selectedServices,
+          serviceDetails,
+          otherService,
+          description,
+          expertise,
+          yearsExperience,
+        }),
+      });
+      onServiceProviderUpdated(updated);
+      setStatus("Your service profile has been updated.");
+    } catch (saveError) {
+      setError(saveError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <main className="business-dashboard service-provider-dashboard">
+      <header className="business-topbar">
+        <a className="brand" href="/" aria-label="Commonground home"><span className="brand-mark">c.</span><span>common<span className="brand-light">ground</span></span></a>
+        <nav className="topbar-nav" aria-label="Service provider navigation">
+          <button className={`nav-button${activeView === "profile" ? " active" : ""}`} type="button" onClick={() => setActiveView("profile")}>Profile</button>
+          <button className={`nav-button${activeView === "chats" ? " active" : ""}`} type="button" onClick={() => { setDealTarget(null); setActiveView("chats"); }}>Service chats</button>
+          <button className={`nav-button${activeView === "deals" ? " active" : ""}`} type="button" onClick={() => setActiveView("deals")}>Active deals</button>
+          <button className={`nav-button${activeView === "reviews" ? " active" : ""}`} type="button" onClick={() => setActiveView("reviews")}>Reviews</button>
+        </nav>
+        <div className="business-topbar-actions"><span>Service provider</span><button className="button button-outline" type="button" onClick={onSignOut}>Sign out</button></div>
+      </header>
+      <section className="business-dashboard-heading">
+        <p className="eyebrow">{activeView === "profile" ? "Your services" : activeView === "chats" ? "Customer support" : activeView === "reviews" ? "Customer feedback" : "Service agreements"}</p>
+        <h1>{serviceProvider.name}</h1>
+        <p>{serviceProvider.pincode} · {(Array.isArray(serviceProvider.services) ? serviceProvider.services : []).slice(0, 3).join(", ")}</p>
+      </section>
+      {activeView === "profile" ? (
+        <form className="service-provider-profile-form" onSubmit={saveProfile}>
+          <h2>Service provider profile</h2>
+          <p>Tell nearby customers about your experience and what you offer.</p>
+          <div className="product-editor-fields">
+            <label>Your name<input value={name} onChange={(event) => setName(event.target.value)} maxLength="80" required /></label>
+            <label>Phone number<input type="tel" value={phone} onChange={(event) => setPhone(event.target.value)} maxLength="20" required /></label>
+            <label>Area pincode<input value={pincode} onChange={(event) => setPincode(event.target.value)} maxLength="6" pattern="[0-9]{6}" required /></label>
+            <label>Years of experience<input type="number" min="0" max="80" value={yearsExperience} onChange={(event) => setYearsExperience(event.target.value)} /></label>
+          </div>
+          <label>Services you provide
+            <ServiceCatalogPicker
+              catalog={serviceCatalog}
+              selectedServices={selectedServices}
+              onServicesChange={(update) => {
+                const nextServices = typeof update === "function" ? update(selectedServices) : update;
+                setSelectedServices(nextServices);
+                setServiceDetails((current) => Object.fromEntries(
+                  Object.entries(current).filter(([service]) => nextServices.includes(service)),
+                ));
+              }}
+              otherService={otherService}
+              onOtherServiceChange={setOtherService}
+              search={serviceSearch}
+              onSearchChange={setServiceSearch}
+            />
+          </label>
+          <ServiceDetailsEditor
+            services={selectedServices}
+            serviceDetails={serviceDetails}
+            otherService={otherService}
+            onDetailsChange={setServiceDetails}
+          />
+          <label>Your expertise<textarea rows="4" maxLength="2000" value={expertise} onChange={(event) => setExpertise(event.target.value)} placeholder="Describe your training, experience, or special skills." /></label>
+          <label>What you offer<textarea rows="4" maxLength="2000" value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Share availability, service details, and what customers can expect." /></label>
+          {error && <p className="chat-error" role="alert">{error}</p>}
+          {status && <p className="profile-feedback success" role="status">{status}</p>}
+          <button className="button button-primary" type="submit" disabled={saving}>{saving ? "Saving…" : "Save profile"}</button>
+        </form>
+      ) : activeView === "chats" ? (
+        <ServiceProviderInbox serviceProvider={serviceProvider} initialDealTarget={dealTarget} />
+      ) : activeView === "reviews" ? (
+        <ServiceProviderReviews serviceProvider={serviceProvider} />
+      ) : (
+        <ActiveDealsView
+          accountType="serviceProvider"
+          accountId={serviceProvider.id}
+          otherService={serviceProvider.otherService}
+          onOpenDeal={(deal) => {
+            setDealTarget({ customer: deal.customer, dealId: deal.id, serviceName: deal.serviceName || "" });
+            setActiveView("chats");
+          }}
+        />
+      )}
+    </main>
+  );
+}
+
+function BusinessProductsManager() {
+  const [products, setProducts] = useState([]);
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [discountType, setDiscountType] = useState("none");
+  const [trackInventory, setTrackInventory] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    request("/api/business/products")
+      .then(({ products: loaded }) => {
+        if (active) setProducts(loaded);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function saveProduct(event) {
+    event.preventDefault();
+    if (saving) return;
+    const form = event.currentTarget;
+    setSaving(true);
+    setError("");
+    setStatus("");
+    const formData = new FormData(form);
+    const photo = formData.get("photo");
+    if (!(photo instanceof File) || !photo.name) formData.delete("photo");
+    const localEndTime = formData.get("discountEndsAt");
+    if (discountType === "timed" && typeof localEndTime === "string" && localEndTime) {
+      const endTimestamp = new Date(localEndTime).getTime();
+      if (Number.isFinite(endTimestamp)) formData.set("discountEndsAt", new Date(endTimestamp).toISOString());
+    }
+    try {
+      const productId = editingProduct?.id;
+      const result = await request(
+        productId ? `/api/business/products/${encodeURIComponent(productId)}` : "/api/business/products",
+        {
+          method: productId ? "PUT" : "POST",
+          body: formData,
+        },
+      );
+      setProducts((current) => productId
+        ? current.map((product) => product.id === result.product.id ? result.product : product)
+        : [...current, result.product]);
+      setEditingProduct(null);
+      setDiscountType("none");
+      setTrackInventory(false);
+      form.reset();
+      setStatus(productId ? "Product updated." : "Product added to your catalog.");
+    } catch (saveError) {
+      setError(saveError.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function updateAvailability(product) {
+    setError("");
+    setStatus("");
+    try {
+      const { product: updatedProduct } = await request(
+        `/api/business/products/${encodeURIComponent(product.id)}/availability`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ available: !product.available }),
+        },
+      );
+      setProducts((current) => current.map((item) => item.id === updatedProduct.id ? updatedProduct : item));
+    } catch (updateError) {
+      setError(updateError.message);
+    }
+  }
+
+  async function removeProduct(product) {
+    if (!window.confirm(`Delete “${product.name}” from your catalog?`)) return;
+    setError("");
+    setStatus("");
+    try {
+      await request(`/api/business/products/${encodeURIComponent(product.id)}`, { method: "DELETE" });
+      setProducts((current) => current.filter((item) => item.id !== product.id));
+      if (editingProduct?.id === product.id) {
+        setEditingProduct(null);
+        setDiscountType("none");
+        setTrackInventory(false);
+      }
+      setStatus("Product deleted.");
+    } catch (deleteError) {
+      setError(deleteError.message);
+    }
+  }
+
+  return (
+    <section className="business-products-manager" aria-labelledby="business-products-heading">
+      <header className="business-gallery-heading">
+        <div>
+          <p className="eyebrow">Catalog</p>
+          <h2 id="business-products-heading">Your products</h2>
+          <p>Add, update, or temporarily mark products unavailable.</p>
+        </div>
+        <span className="people-count">{products.length}</span>
+      </header>
+      <form className="product-editor-form" key={editingProduct?.id || "new-product"} onSubmit={saveProduct}>
+        <h3>{editingProduct ? "Edit product" : "Add a product"}</h3>
+        <div className="product-editor-fields">
+          <label>
+            Item name
+            <input name="name" defaultValue={editingProduct?.name || ""} maxLength={100} required />
+          </label>
+          <label>
+            Price
+            <input name="price" type="number" min="0" max="99999999" step="0.01" defaultValue={editingProduct?.price ?? ""} required />
+          </label>
+        </div>
+        <fieldset className="product-discount-fields">
+          <legend>Product discount</legend>
+          <label>
+            Discount type
+            <select
+              value={discountType}
+              onChange={(event) => setDiscountType(event.target.value)}
+            >
+              <option value="none">No discount</option>
+              <option value="ongoing">Ongoing discount</option>
+              <option value="timed">Limited-time discount</option>
+            </select>
+          </label>
+          {discountType !== "none" && (
+            <div className="product-editor-fields">
+              <label>
+                Discount percentage
+                <input
+                  name="discountPercent"
+                  type="number"
+                  min="1"
+                  max="99"
+                  step="1"
+                  defaultValue={editingProduct?.discountPercent || ""}
+                  required
+                />
+              </label>
+              {discountType === "timed" && (
+                <label>
+                  Offer ends at
+                  <input
+                    name="discountEndsAt"
+                    type="datetime-local"
+                    min={localDateTimeValue(new Date(now + 60_000).toISOString())}
+                    defaultValue={localDateTimeValue(editingProduct?.discountEndsAt)}
+                    required
+                  />
+                </label>
+              )}
+            </div>
+          )}
+          <input type="hidden" name="discountType" value={discountType} />
+          {discountType === "none" && <input type="hidden" name="discountPercent" value="0" />}
+        </fieldset>
+        <fieldset className="product-inventory-fields">
+          <legend>Stock tracking <span className="optional">Optional</span></legend>
+          <label className="product-inventory-toggle">
+            <input
+              type="checkbox"
+              checked={trackInventory}
+              onChange={(event) => setTrackInventory(event.target.checked)}
+            />
+            <span>Track the quantity in stock for this product</span>
+          </label>
+          <input type="hidden" name="trackInventory" value={trackInventory ? "true" : "false"} />
+          {trackInventory ? (
+            <label>
+              Quantity in stock
+              <input
+                name="stockQuantity"
+                type="number"
+                min="0"
+                max="1000000"
+                step="1"
+                defaultValue={editingProduct?.trackInventory ? editingProduct.stockQuantity : ""}
+                required
+              />
+              <span className="field-hint">Orders reduce this quantity automatically. Set 0 to mark it sold out.</span>
+            </label>
+          ) : (
+            <>
+              <p className="field-hint">Leave stock tracking off for made-to-order or unlimited items like pizza.</p>
+              <input type="hidden" name="stockQuantity" value="0" />
+            </>
+          )}
+        </fieldset>
+        <label>
+          Description
+          <textarea name="description" rows="3" maxLength={2000} defaultValue={editingProduct?.description || ""} placeholder="Describe this product…" />
+        </label>
+        <label>
+          Product photo {editingProduct ? <span className="optional">Optional · leave blank to keep current photo</span> : <span className="required">*</span>}
+          <input name="photo" type="file" accept="image/jpeg,image/png,image/webp" required={!editingProduct} />
+          <span className="field-hint">JPG, PNG, or WebP · 4 MB maximum</span>
+        </label>
+        {error && <p className="chat-error" role="alert">{error}</p>}
+        {status && <p className="profile-feedback success" role="status">{status}</p>}
+        <div className="product-editor-actions">
+          {editingProduct && (
+            <button className="button button-outline" type="button" onClick={() => {
+              setEditingProduct(null);
+              setDiscountType("none");
+              setTrackInventory(false);
+            }}>
+              Cancel edit
+            </button>
+          )}
+          <button className="button button-primary" type="submit" disabled={saving}>
+            {saving ? "Saving…" : editingProduct ? "Save changes" : "Add product"}
+          </button>
+        </div>
+      </form>
+      {loading ? (
+        <p className="deal-empty">Loading products…</p>
+      ) : products.length === 0 ? (
+        <p className="deal-empty">Your products will appear here after you add them.</p>
+      ) : (
+        <div className="managed-products-grid">
+          {products.map((product) => (
+            <article className={`managed-product-card${product.available ? "" : " unavailable"}`} key={product.id}>
+              <img src={product.photoUrl} alt={product.name} />
+              <div>
+                <span className={`product-availability${product.available ? "" : " unavailable"}`}>
+                  {!product.available
+                    ? "Temporarily unavailable"
+                    : product.trackInventory && product.stockQuantity === 0
+                      ? "Sold out"
+                      : product.trackInventory
+                        ? `${product.stockQuantity} in stock`
+                        : "Available · stock not tracked"}
+                </span>
+                <h3>{product.name}</h3>
+                {isProductDiscountActive(product, now) ? (
+                  <div className="managed-product-price">
+                    <strong>{discountedProductPrice(product).toFixed(2)}</strong>
+                    <del>{product.price.toFixed(2)}</del>
+                    <span>{product.discountPercent}% off</span>
+                  </div>
+                ) : <strong>{product.price.toFixed(2)}</strong>}
+                {product.discountType === "timed" && product.discountEndsAt && (
+                  <DiscountCountdown endsAt={product.discountEndsAt} now={now} />
+                )}
+                {product.description && <p>{product.description}</p>}
+                <div className="product-card-actions">
+                  <button className="button button-outline" type="button" onClick={() => {
+                    setDiscountType(isProductDiscountActive(product, now) ? product.discountType : "none");
+                    setTrackInventory(product.trackInventory === true);
+                    setEditingProduct(product);
+                  }}>Edit</button>
+                  <button className="button button-outline" type="button" onClick={() => updateAvailability(product)}>
+                    Mark {product.available ? "unavailable" : "available"}
+                  </button>
+                  <button className="product-delete-button" type="button" onClick={() => removeProduct(product)}>Delete</button>
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BusinessProductCatalog({ businessId, customerId, business, onCartDealPlaced }) {
+  const [products, setProducts] = useState([]);
+  const [cart, setCart] = useState({});
+  const [expandedProductId, setExpandedProductId] = useState(null);
+  const [error, setError] = useState("");
+  const [cartError, setCartError] = useState("");
+  const [placingDeal, setPlacingDeal] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [cartLoaded, setCartLoaded] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const cartKey = `commonground-cart-${customerId}-${businessId}`;
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    request(`/api/neighborhood/businesses/${encodeURIComponent(businessId)}/products`)
+      .then(({ products: loaded }) => {
+        if (active) setProducts(loaded);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    try {
+      const savedCart = window.localStorage.getItem(cartKey);
+      if (savedCart) {
+        const parsedCart = JSON.parse(savedCart);
+        if (!parsedCart || typeof parsedCart !== "object" || Array.isArray(parsedCart)) {
+          throw new Error("Saved cart data is invalid.");
+        }
+        if (active) setCart(parsedCart);
+      }
+    } catch (storageError) {
+      if (active) setCartError(`Could not load your saved cart: ${storageError.message}`);
+    } finally {
+      if (active) setCartLoaded(true);
+    }
+    return () => {
+      active = false;
+    };
+  }, [businessId, cartKey]);
+
+  useEffect(() => {
+    if (!cartLoaded) return;
+    try {
+      window.localStorage.setItem(cartKey, JSON.stringify(cart));
+      setCartError("");
+    } catch (storageError) {
+      setCartError(`Could not save your cart: ${storageError.message}`);
+    }
+  }, [cart, cartKey, cartLoaded]);
+
+  function changeQuantity(product, change) {
+    setCart((current) => {
+      const nextQuantity = (Number(current[product.id]) || 0) + change;
+      if (nextQuantity <= 0) {
+        const next = { ...current };
+        delete next[product.id];
+        return next;
+      }
+      if (
+        change > 0 &&
+        (
+          !product.available ||
+          nextQuantity > 99 ||
+          (product.trackInventory === true && nextQuantity > product.stockQuantity)
+        )
+      ) return current;
+      return { ...current, [product.id]: nextQuantity };
+    });
+  }
+
+  async function placeCartDeal() {
+    if (placingDeal || cartItems.length === 0) return;
+    setPlacingDeal(true);
+    setCartError("");
+    try {
+      const { deal } = await request(
+        `/api/neighborhood/businesses/${encodeURIComponent(businessId)}/cart-deals`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            items: cartItems.map(({ productId, quantity }) => ({ productId, quantity })),
+          }),
+        },
+      );
+      let cartClearWarning = "";
+      try {
+        window.localStorage.removeItem(cartKey);
+      } catch (storageError) {
+        cartClearWarning = `The deal was placed, but your saved cart could not be cleared: ${storageError.message}`;
+      }
+      setCart({});
+      onCartDealPlaced(deal, business, cartClearWarning);
+    } catch (placeError) {
+      setCartError(placeError.message);
+    } finally {
+      setPlacingDeal(false);
+    }
+  }
+
+  const cartItems = Object.entries(cart)
+    .map(([productId, quantity]) => ({
+      product: products.find((item) => item.id === productId),
+      quantity: Number(quantity),
+      productId,
+    }))
+    .filter(({ quantity }) => Number.isInteger(quantity) && quantity > 0);
+  const cartTotal = cartItems.reduce(
+    (total, { product, quantity }) => total + (product
+      ? (isProductDiscountActive(product, now) ? discountedProductPrice(product) : product.price) * quantity
+      : 0),
+    0,
+  );
+
+  return (
+    <section className="business-product-catalog" aria-label="Business products">
+      <header className="business-products-heading">
+        <div>
+          <p className="eyebrow">Shop local</p>
+          <h4>Products</h4>
+        </div>
+        <span className="people-count">{products.length}</span>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {loading ? (
+        <p className="product-catalog-empty">Loading products…</p>
+      ) : products.length === 0 ? (
+        <p className="product-catalog-empty">No products listed yet.</p>
+      ) : (
+        <div className="product-catalog-grid">
+          {products.map((product) => (
+            <article className={`product-catalog-card${product.available ? "" : " unavailable"}`} key={product.id}>
+              <button
+                className="product-catalog-info"
+                type="button"
+                aria-expanded={expandedProductId === product.id}
+                onClick={() => setExpandedProductId((current) => current === product.id ? null : product.id)}
+              >
+                <img src={product.photoUrl} alt={product.name} loading="lazy" />
+                <span className="product-catalog-name">{product.name}</span>
+                {isProductDiscountActive(product, now) ? (
+                  <span className="product-discount-prices">
+                    <strong>₹{discountedProductPrice(product).toFixed(2)}</strong>
+                    <del>₹{Number(product.price).toFixed(2)}</del>
+                    <span className="product-discount-badge">{product.discountPercent}% off</span>
+                  </span>
+                ) : <strong>₹{Number(product.price).toFixed(2)}</strong>}
+                {product.discountType === "timed" && product.discountEndsAt && (
+                  <DiscountCountdown endsAt={product.discountEndsAt} now={now} />
+                )}
+                {product.description && (
+                  <span className={`product-catalog-description${expandedProductId === product.id ? " expanded" : ""}`}>
+                    {product.description}
+                  </span>
+                )}
+                {product.description && (
+                  <span className="product-details-hint">
+                    {expandedProductId === product.id ? "Show less" : "View full description"}
+                  </span>
+                )}
+              </button>
+              <button
+                className="button button-outline product-add-button"
+                type="button"
+                disabled={
+                  !product.available ||
+                  (product.trackInventory === true && product.stockQuantity <= 0) ||
+                  (product.trackInventory === true && (Number(cart[product.id]) || 0) >= product.stockQuantity)
+                }
+                onClick={() => changeQuantity(product, 1)}
+              >
+                {!product.available
+                  ? "Temporarily unavailable"
+                  : product.trackInventory === true && product.stockQuantity <= 0
+                    ? "Sold out"
+                    : product.trackInventory === true && (Number(cart[product.id]) || 0) >= product.stockQuantity
+                      ? "Stock limit reached"
+                      : "Add to cart"}
+              </button>
+              {product.trackInventory === true && product.stockQuantity > 0 && (
+                <span className="product-stock-note">
+                  {product.stockQuantity} {product.stockQuantity === 1 ? "item" : "items"} remaining
+                </span>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+      <section className="business-cart" aria-label="Shopping cart">
+        <header>
+          <h5>Your cart</h5>
+          <span>{cartItems.reduce((count, item) => count + item.quantity, 0)} items</span>
+        </header>
+        {cartItems.length === 0 ? (
+          <p className="product-catalog-empty">Your cart is empty.</p>
+        ) : (
+          <>
+            <ul>
+              {cartItems.map(({ product, quantity, productId }) => (
+                <li key={productId}>
+                  <span>
+                    {product?.name || "Product no longer available"}
+                    {product && (
+                      <span className="cart-item-price">
+                        {" "}· ₹{(isProductDiscountActive(product, now) ? discountedProductPrice(product) : product.price).toFixed(2)} each
+                      </span>
+                    )}
+                  </span>
+                  <div className="cart-item-controls">
+                    <button type="button" aria-label="Decrease quantity" onClick={() => changeQuantity({ id: productId, available: true }, -1)}>−</button>
+                    <span>{quantity}</span>
+                    <button
+                      type="button"
+                      aria-label="Increase quantity"
+                      disabled={!product?.available || quantity >= 99}
+                      onClick={() => product && changeQuantity(product, 1)}
+                    >+</button>
+                    <button className="cart-remove-button" type="button" onClick={() => setCart((current) => {
+                      const next = { ...current };
+                      delete next[productId];
+                      return next;
+                    })}>Remove</button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <strong className="cart-total">Estimated total: ₹{cartTotal.toFixed(2)}</strong>
+            <p className="field-hint">Placing this deal automatically accepts the item and price summary. You can continue in the deal chat.</p>
+            <button
+              className="button button-primary cart-place-deal"
+              type="button"
+              disabled={placingDeal || cartItems.length === 0 || cartItems.some(({ product, quantity }) => (
+                !product ||
+                !product.available ||
+                (product.trackInventory === true && quantity > product.stockQuantity)
+              ))}
+              onClick={placeCartDeal}
+            >
+              {placingDeal ? "Placing deal…" : "Place a deal"}
+            </button>
+          </>
+        )}
+        {cartError && <p className="chat-error" role="alert">{cartError}</p>}
+      </section>
+    </section>
+  );
+}
+
 function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -539,8 +1936,10 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
         </a>
         <nav className="topbar-nav" aria-label="Business navigation">
           <button className={`nav-button${activeView === "profile" ? " active" : ""}`} type="button" onClick={() => setActiveView("profile")}>Profile</button>
+          <button className={`nav-button${activeView === "products" ? " active" : ""}`} type="button" onClick={() => setActiveView("products")}>Products</button>
           <button className={`nav-button${activeView === "inbox" ? " active" : ""}`} type="button" onClick={() => setActiveView("inbox")}>Business chats</button>
           <button className={`nav-button${activeView === "activeDeals" ? " active" : ""}`} type="button" onClick={() => setActiveView("activeDeals")}>Active deals</button>
+          <button className={`nav-button${activeView === "reviews" ? " active" : ""}`} type="button" onClick={() => setActiveView("reviews")}>Reviews</button>
         </nav>
         <div className="business-topbar-actions">
           <span>Business account</span>
@@ -548,11 +1947,13 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
         </div>
       </header>
       <section className="business-dashboard-heading">
-        <p className="eyebrow">{activeView === "inbox" ? "Customer support" : activeView === "activeDeals" ? "Agreements" : "Business profile"}</p>
+        <p className="eyebrow">{activeView === "inbox" ? "Customer support" : activeView === "activeDeals" ? "Agreements" : activeView === "reviews" ? "Customer feedback" : activeView === "products" ? "Inventory" : "Business profile"}</p>
         <h1>{business.businessName}</h1>
         <p>{business.category} · {business.pincode}</p>
       </section>
-      {activeView === "inbox" ? <BusinessInbox business={business} initialDealTarget={activeDealTarget} /> : activeView === "activeDeals" ? (
+      {activeView === "products" ? (
+        <BusinessProductsManager key={business.id} />
+      ) : activeView === "inbox" ? <BusinessInbox business={business} initialDealTarget={activeDealTarget} /> : activeView === "activeDeals" ? (
         <ActiveDealsView
           accountType="business"
           accountId={business.id}
@@ -560,6 +1961,12 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
             setActiveDealTarget({ customer: deal.customer, dealId: deal.id });
             setActiveView("inbox");
           }}
+        />
+      ) : activeView === "reviews" ? (
+        <BusinessReviews
+          accountType="business"
+          businessId={business.id}
+          businessName={business.businessName}
         />
       ) : (
       <div className="business-dashboard-grid">
@@ -654,7 +2061,444 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
   );
 }
 
-function BusinessDirectoryView({ businesses, loading, error, search, onSearch, onOpenChat }) {
+function RatingStars({ rating, label }) {
+  const roundedRating = Math.round(rating || 0);
+  return (
+    <span className="rating-stars" role="img" aria-label={label || `${rating || 0} out of 5 stars`}>
+      {"★".repeat(roundedRating)}{"☆".repeat(5 - roundedRating)}
+    </span>
+  );
+}
+
+function ServiceReviews({ provider, serviceName, serviceLabel }) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = provider.serviceRatingSummaries?.[serviceName] || { averageRating: 0, reviewCount: 0 };
+  const [currentSummary, setCurrentSummary] = useState(summary);
+  useEffect(() => setCurrentSummary(summary), [provider.serviceRatingSummaries, serviceName]);
+  return (
+    <div className="service-reviews">
+      <div className="business-directory-rating">
+        <RatingStars rating={currentSummary.averageRating} label={`${serviceLabel} average rating ${currentSummary.averageRating} out of 5`} />
+        <strong>{Number(currentSummary.averageRating || 0).toFixed(1)}</strong>
+        <span>{currentSummary.reviewCount || 0} {currentSummary.reviewCount === 1 ? "review" : "reviews"}</span>
+      </div>
+      <button
+        className="business-reviews-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {expanded ? "Hide service reviews" : `Read ${serviceLabel} reviews & rate`}
+      </button>
+      {expanded && (
+        <ServiceReviewForm
+          provider={provider}
+          serviceName={serviceName}
+          serviceLabel={serviceLabel}
+          onSummaryChange={setCurrentSummary}
+        />
+      )}
+    </div>
+  );
+}
+
+function ServiceReviewForm({ provider, serviceName, serviceLabel, onSummaryChange }) {
+  const reviewsUrl = `/api/service-providers/providers/${encodeURIComponent(provider.id)}/reviews?serviceName=${encodeURIComponent(serviceName)}`;
+  const [reviews, setReviews] = useState([]);
+  const [averageRating, setAverageRating] = useState(0);
+  const [reviewCount, setReviewCount] = useState(0);
+  const [distribution, setDistribution] = useState({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
+  const [canReview, setCanReview] = useState(false);
+  const [myReview, setMyReview] = useState(null);
+  const [rating, setRating] = useState(0);
+  const [comment, setComment] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    request(reviewsUrl)
+      .then((result) => {
+        if (!active) return;
+        setReviews(result.reviews);
+        setAverageRating(result.averageRating);
+        setReviewCount(result.reviewCount);
+        setDistribution(result.distribution);
+        setCanReview(Boolean(result.canReview));
+        setMyReview(result.myReview);
+        onSummaryChange({ averageRating: result.averageRating, reviewCount: result.reviewCount });
+        setRating(result.myReview?.rating || 0);
+        setComment(result.myReview?.comment || "");
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [reviewsUrl]);
+
+  async function submitReview(event) {
+    event.preventDefault();
+    if (!rating || submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const result = await request(`/api/service-providers/providers/${encodeURIComponent(provider.id)}/reviews`, {
+        method: "POST",
+        body: JSON.stringify({ serviceName, rating, comment }),
+      });
+      setReviews(result.reviews);
+      setAverageRating(result.averageRating);
+      setReviewCount(result.reviewCount);
+      setDistribution(result.distribution);
+      setCanReview(Boolean(result.canReview));
+      setMyReview(result.myReview);
+      onSummaryChange({ averageRating: result.averageRating, reviewCount: result.reviewCount });
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const visibleReviews = filter === "all" ? reviews : reviews.filter((review) => review.rating === Number(filter));
+  return (
+    <section className="business-reviews service-review-details" aria-label={`${serviceLabel} reviews for ${provider.name}`}>
+      <header className="reviews-summary">
+        <div><p className="eyebrow">Service reviews</p><h4>{serviceLabel} · {provider.name}</h4></div>
+        <div className="reviews-average">
+          <RatingStars rating={averageRating} label={`${serviceLabel} average rating ${averageRating} out of 5`} />
+          <strong>{averageRating.toFixed(1)}</strong>
+          <span>{reviewCount} {reviewCount === 1 ? "review" : "reviews"}</span>
+        </div>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {canReview && (
+        <form className="business-review-form" onSubmit={submitReview}>
+          <h4>{myReview ? "Update your review" : `Review ${serviceLabel}`}</h4>
+          <fieldset>
+            <legend>Choose a star rating</legend>
+            <div className="review-star-picker">
+              {[1, 2, 3, 4, 5].map((stars) => (
+                <button type="button" key={stars} className={stars <= rating ? "selected" : ""} aria-label={`${stars} ${stars === 1 ? "star" : "stars"}`} aria-pressed={rating === stars} onClick={() => setRating(stars)}>
+                  {stars <= rating ? "★" : "☆"}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          <label htmlFor={`service-review-comment-${provider.id}-${serviceName}`}>Comment <span className="optional">Optional</span></label>
+          <textarea
+            id={`service-review-comment-${provider.id}-${serviceName}`}
+            value={comment}
+            onChange={(event) => setComment(event.target.value)}
+            maxLength={1500}
+            rows={3}
+            placeholder={`Share your experience with ${serviceLabel.toLocaleLowerCase()}…`}
+          />
+          <button className="button button-primary" type="submit" disabled={!rating || submitting}>
+            {submitting ? "Saving…" : myReview ? "Update review" : "Post review"}
+          </button>
+        </form>
+      )}
+      {!canReview && <p className="review-eligibility-note">Review this service after you have an accepted or fulfilled deal with this provider for this service.</p>}
+      <div className="review-filter" role="group" aria-label={`Filter ${serviceLabel} reviews by rating`}>
+        <button className={filter === "all" ? "active" : ""} type="button" aria-pressed={filter === "all"} onClick={() => setFilter("all")}>All <span>{reviewCount}</span></button>
+        {[5, 4, 3, 2, 1].map((stars) => (
+          <button className={filter === String(stars) ? "active" : ""} type="button" key={stars} aria-pressed={filter === String(stars)} onClick={() => setFilter(String(stars))}>
+            {stars} ★ <span>{distribution[stars]}</span>
+          </button>
+        ))}
+      </div>
+      {loading ? <p className="review-empty">Loading reviews…</p> : visibleReviews.length === 0 ? (
+        <p className="review-empty">{reviews.length ? `No ${filter}-star reviews yet.` : "No reviews yet. Verified customer reviews will appear here."}</p>
+      ) : (
+        <div className="review-list">
+          {visibleReviews.map((review) => (
+            <article className="business-review" key={review.id}>
+              <header><strong>{review.reviewerName}</strong><time dateTime={review.updatedAt}>{new Date(review.updatedAt).toLocaleDateString()}</time></header>
+              <RatingStars rating={review.rating} label={`${review.rating} out of 5 stars`} />
+              {review.comment && <p>{review.comment}</p>}
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ServiceProviderReviews({ serviceProvider }) {
+  const [serviceReviews, setServiceReviews] = useState([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let active = true;
+    request("/api/service-providers/reviews")
+      .then(({ serviceReviews: loaded }) => {
+        if (active) setServiceReviews(loaded);
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [serviceProvider.id, serviceProvider.updatedAt]);
+
+  return (
+    <section className="business-reviews business-owner-reviews" aria-label="Customer reviews for your services">
+      <header className="reviews-summary">
+        <div><p className="eyebrow">Customer feedback</p><h3>Reviews by service</h3></div>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {loading ? <p className="review-empty">Loading service reviews…</p> : (
+        <div className="service-review-groups">
+          {serviceReviews.map((service) => (
+            <section className="service-review-group" key={service.serviceName}>
+              <header className="reviews-summary">
+                <div><h4>{service.serviceName === "Other" ? serviceProvider.otherService || "Other" : service.serviceName}</h4></div>
+                <div className="reviews-average">
+                  <RatingStars rating={service.averageRating} label={`${service.serviceName} average rating ${service.averageRating} out of 5`} />
+                  <strong>{Number(service.averageRating || 0).toFixed(1)}</strong>
+                  <span>{service.reviewCount} {service.reviewCount === 1 ? "review" : "reviews"}</span>
+                </div>
+              </header>
+              <div className="review-distribution" aria-label={`${service.serviceName} ratings breakdown`}>
+                {[5, 4, 3, 2, 1].map((stars) => (
+                  <div className="review-distribution-row" key={stars}>
+                    <span>{stars} stars</span>
+                    <span className="review-distribution-track"><span style={{ width: `${service.reviewCount ? (service.distribution[stars] / service.reviewCount) * 100 : 0}%` }} /></span>
+                    <strong>{service.distribution[stars]}</strong>
+                  </div>
+                ))}
+              </div>
+              {service.reviews.length === 0 ? <p className="review-empty">No reviews for this service yet.</p> : (
+                <div className="review-list">
+                  {service.reviews.map((review) => (
+                    <article className="business-review" key={review.id}>
+                      <header><strong>{review.reviewerName}</strong><time dateTime={review.updatedAt}>{new Date(review.updatedAt).toLocaleDateString()}</time></header>
+                      <RatingStars rating={review.rating} label={`${review.rating} out of 5 stars`} />
+                      {review.comment && <p>{review.comment}</p>}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BusinessReviews({ businessId, businessName, accountType = "user", onSummaryChange }) {
+  const [reviews, setReviews] = useState([]);
+  const [averageRating, setAverageRating] = useState(0);
+  const [reviewCount, setReviewCount] = useState(0);
+  const [distribution, setDistribution] = useState({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
+  const [canReview, setCanReview] = useState(false);
+  const [myReview, setMyReview] = useState(null);
+  const [rating, setRating] = useState(0);
+  const [comment, setComment] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const isBusiness = accountType === "business";
+  const reviewsUrl = isBusiness
+    ? "/api/business/reviews"
+    : `/api/neighborhood/businesses/${encodeURIComponent(businessId)}/reviews`;
+
+  useEffect(() => {
+    let active = true;
+    request(reviewsUrl)
+      .then((result) => {
+        if (!active) return;
+        setReviews(result.reviews);
+        setAverageRating(result.averageRating);
+        setReviewCount(result.reviewCount);
+        setDistribution(result.distribution);
+        setCanReview(Boolean(result.canReview));
+        setMyReview(result.myReview);
+        onSummaryChange?.({
+          averageRating: result.averageRating,
+          reviewCount: result.reviewCount,
+          distribution: result.distribution,
+        });
+        setRating(result.myReview?.rating || 0);
+        setComment(result.myReview?.comment || "");
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [reviewsUrl]);
+
+  async function submitReview(event) {
+    event.preventDefault();
+    if (!rating || submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const result = await request(reviewsUrl, {
+        method: "POST",
+        body: JSON.stringify({ rating, comment }),
+      });
+      setReviews(result.reviews);
+      setAverageRating(result.averageRating);
+      setReviewCount(result.reviewCount);
+      setDistribution(result.distribution);
+      setCanReview(Boolean(result.canReview));
+      setMyReview(result.myReview);
+      onSummaryChange?.({
+        averageRating: result.averageRating,
+        reviewCount: result.reviewCount,
+        distribution: result.distribution,
+      });
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const visibleReviews = filter === "all"
+    ? reviews
+    : reviews.filter((review) => review.rating === Number(filter));
+
+  return (
+    <section className={`business-reviews${isBusiness ? " business-owner-reviews" : ""}`} aria-label={`${businessName} reviews`}>
+      <header className="reviews-summary">
+        <div>
+          <p className="eyebrow">{isBusiness ? "Customer feedback" : "Customer reviews"}</p>
+          <h3>{isBusiness ? "Reviews for your business" : `Reviews for ${businessName}`}</h3>
+        </div>
+        <div className="reviews-average">
+          <RatingStars rating={averageRating} label={`Average rating ${averageRating} out of 5`} />
+          <strong>{averageRating.toFixed(1)}</strong>
+          <span>{reviewCount} {reviewCount === 1 ? "review" : "reviews"}</span>
+        </div>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {isBusiness && (
+        <div className="review-distribution" aria-label="Ratings breakdown">
+          {[5, 4, 3, 2, 1].map((stars) => (
+            <div className="review-distribution-row" key={stars}>
+              <span>{stars} stars</span>
+              <span className="review-distribution-track">
+                <span style={{ width: `${reviewCount ? (distribution[stars] / reviewCount) * 100 : 0}%` }} />
+              </span>
+              <strong>{distribution[stars]}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {!isBusiness && canReview && (
+        <form className="business-review-form" onSubmit={submitReview}>
+          <h4>{myReview ? "Update your review" : "Share your experience"}</h4>
+          <fieldset>
+            <legend>Choose a star rating</legend>
+            <div className="review-star-picker">
+              {[1, 2, 3, 4, 5].map((stars) => (
+                <button
+                  type="button"
+                  key={stars}
+                  className={stars <= rating ? "selected" : ""}
+                  aria-label={`${stars} ${stars === 1 ? "star" : "stars"}`}
+                  aria-pressed={rating === stars}
+                  onClick={() => setRating(stars)}
+                >
+                  {stars <= rating ? "★" : "☆"}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+          <label htmlFor={`business-review-comment-${businessId}`}>Comment <span className="optional">Optional</span></label>
+          <textarea
+            id={`business-review-comment-${businessId}`}
+            value={comment}
+            onChange={(event) => setComment(event.target.value)}
+            maxLength={1500}
+            rows={3}
+            placeholder="Tell others about your experience with this business…"
+          />
+          <button className="button button-primary" type="submit" disabled={!rating || submitting}>
+            {submitting ? "Saving…" : myReview ? "Update review" : "Post review"}
+          </button>
+        </form>
+      )}
+      {!isBusiness && !canReview && (
+        <p className="review-eligibility-note">
+          Reviews are available to customers after a deal has been accepted.
+        </p>
+      )}
+      <div className="review-filter" role="group" aria-label="Filter reviews by rating">
+        <button className={filter === "all" ? "active" : ""} type="button" aria-pressed={filter === "all"} onClick={() => setFilter("all")}>
+          All <span>{reviewCount}</span>
+        </button>
+        {[5, 4, 3, 2, 1].map((stars) => (
+          <button
+            className={filter === String(stars) ? "active" : ""}
+            type="button"
+            key={stars}
+            aria-pressed={filter === String(stars)}
+            onClick={() => setFilter(String(stars))}
+          >
+            {stars} ★ <span>{distribution[stars]}</span>
+          </button>
+        ))}
+      </div>
+      {loading ? (
+        <p className="review-empty">Loading reviews…</p>
+      ) : visibleReviews.length === 0 ? (
+        <p className="review-empty">
+          {reviews.length ? `No ${filter}-star reviews yet.` : "No reviews yet. Verified customer reviews will appear here."}
+        </p>
+      ) : (
+        <div className="review-list">
+          {visibleReviews.map((review) => (
+            <article className="business-review" key={review.id}>
+              <header>
+                <strong>{review.reviewerName}</strong>
+                <time dateTime={review.updatedAt}>{new Date(review.updatedAt).toLocaleDateString()}</time>
+              </header>
+              <RatingStars rating={review.rating} label={`${review.rating} out of 5 stars`} />
+              {review.comment && <p>{review.comment}</p>}
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BusinessDirectoryView({
+  businesses,
+  customerId,
+  loading,
+  error,
+  search,
+  onSearch,
+  onOpenChat,
+  onCartDealPlaced,
+  onBusinessRatingUpdated,
+}) {
+  const [expandedBusinessId, setExpandedBusinessId] = useState(null);
+  const [productsBusinessId, setProductsBusinessId] = useState(null);
   return (
     <section className="business-directory-page" aria-label="Businesses nearby">
       <header className="connections-heading">
@@ -700,6 +2544,11 @@ function BusinessDirectoryView({ businesses, loading, error, search, onSearch, o
               <div className="business-directory-copy">
                 <span className="business-category-chip">{business.category}</span>
                 <h3>{business.businessName}</h3>
+                <div className="business-directory-rating">
+                  <RatingStars rating={business.averageRating} label={`Average rating ${business.averageRating} out of 5`} />
+                  <strong>{Number(business.averageRating || 0).toFixed(1)}</strong>
+                  <span>{business.reviewCount || 0} {business.reviewCount === 1 ? "review" : "reviews"}</span>
+                </div>
                 <p>{business.description || business.address}</p>
                 {business.services?.length > 0 && (
                   <div className="interest-list">
@@ -715,6 +2564,38 @@ function BusinessDirectoryView({ businesses, loading, error, search, onSearch, o
                 >
                   Message business
                 </button>
+                <button
+                  className="business-reviews-toggle"
+                  type="button"
+                  aria-expanded={productsBusinessId === business.id}
+                  onClick={() => setProductsBusinessId((current) => current === business.id ? null : business.id)}
+                >
+                  {productsBusinessId === business.id ? "Hide products" : "View products & cart"}
+                </button>
+                {productsBusinessId === business.id && (
+                  <BusinessProductCatalog
+                    key={`${customerId}-${business.id}`}
+                    businessId={business.id}
+                    customerId={customerId}
+                    business={business}
+                    onCartDealPlaced={onCartDealPlaced}
+                  />
+                )}
+                <button
+                  className="business-reviews-toggle"
+                  type="button"
+                  aria-expanded={expandedBusinessId === business.id}
+                  onClick={() => setExpandedBusinessId((current) => current === business.id ? null : business.id)}
+                >
+                  {expandedBusinessId === business.id ? "Hide reviews" : "Read reviews & rate"}
+                </button>
+                {expandedBusinessId === business.id && (
+                  <BusinessReviews
+                    businessId={business.id}
+                    businessName={business.businessName}
+                    onSummaryChange={(summary) => onBusinessRatingUpdated(business.id, summary)}
+                  />
+                )}
               </div>
             </article>
           ))}
@@ -897,7 +2778,16 @@ function BusinessChatsView({
   );
 }
 
-function DealCenter({ accountType, userId, businessId, businessName, focusedDealId }) {
+function DealCenter({
+  accountType,
+  userId,
+  businessId,
+  businessName,
+  focusedDealId,
+  serviceName = "",
+  serviceDisplayName = serviceName,
+  otherServiceDisplayName = "Other",
+}) {
   const [deals, setDeals] = useState([]);
   const [filter, setFilter] = useState("all");
   const [proposal, setProposal] = useState("");
@@ -909,11 +2799,27 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
   const [sending, setSending] = useState(false);
   const focusedDealRef = useRef(null);
 
+  const serviceDeal = accountType === "serviceCustomer" || accountType === "serviceProvider";
   const listUrl = accountType === "user"
     ? `/api/neighborhood/businesses/${encodeURIComponent(businessId)}/deals`
-    : `/api/business/conversations/${encodeURIComponent(userId)}/deals`;
-  const dealsUrl = accountType === "user" ? "/api/neighborhood/deals" : "/api/business/deals";
-  const creatorType = accountType;
+    : accountType === "serviceCustomer"
+      ? `/api/service-providers/providers/${encodeURIComponent(businessId)}/deals`
+      : accountType === "serviceProvider"
+        ? `/api/service-providers/conversations/${encodeURIComponent(userId)}/deals`
+        : `/api/business/conversations/${encodeURIComponent(userId)}/deals`;
+  const dealsUrl = accountType === "user"
+    ? "/api/neighborhood/deals"
+    : accountType === "serviceCustomer"
+      ? "/api/service-providers/deals"
+      : accountType === "serviceProvider"
+        ? "/api/service-providers/provider-deals"
+        : "/api/business/deals";
+  const creatorType = accountType === "serviceCustomer" ? "user" : accountType;
+  const otherPartyName = accountType === "serviceCustomer"
+    ? businessName
+    : accountType === "serviceProvider"
+      ? businessName
+      : accountType === "user" ? businessName : "the customer";
 
   useEffect(() => {
     let active = true;
@@ -935,13 +2841,16 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
       });
 
     const socket = io({ withCredentials: true });
-    socket.on("business-deal:update", (updatedDeal) => {
-      if (updatedDeal.userId !== userId || updatedDeal.businessId !== businessId) return;
+    const handleDealUpdate = (updatedDeal) => {
+      if (serviceDeal
+        ? updatedDeal.userId !== userId || updatedDeal.serviceProviderId !== businessId
+        : updatedDeal.userId !== userId || updatedDeal.businessId !== businessId) return;
       setDeals((current) => [
         updatedDeal,
         ...current.filter((deal) => deal.id !== updatedDeal.id),
       ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
-    });
+    };
+    socket.on(serviceDeal ? "service-deal:update" : "business-deal:update", handleDealUpdate);
     socket.on("connect_error", () => {
       setError("Live deal updates are reconnecting. Refresh to check the latest status.");
     });
@@ -964,7 +2873,7 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
     try {
       const { deal } = await request(listUrl, {
         method: "POST",
-        body: JSON.stringify({ proposal: text }),
+        body: JSON.stringify(serviceDeal ? { proposal: text, serviceName } : { proposal: text }),
       });
       setDeals((current) => [deal, ...current.filter((item) => item.id !== deal.id)]);
       setProposal("");
@@ -1015,10 +2924,10 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
     return true;
   });
 
-  function statusLabel(status) {
+  function statusLabel(status, autoAccepted) {
     return {
       pending: "Awaiting response",
-      accepted: "Accepted · Active",
+      accepted: autoAccepted ? "Order · Auto-accepted" : "Accepted · Active",
       declined: "Not proceeding",
       fulfilled: "Fulfilled",
     }[status] || "Status unavailable";
@@ -1029,12 +2938,13 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
       <header className="deal-center-heading">
         <div>
           <p className="eyebrow">Agreements</p>
-          <h2>Deals with {businessName}</h2>
+          <h2>Deals with {otherPartyName}</h2>
         </div>
-        <button className="button button-primary deal-create-toggle" type="button" onClick={() => setProposalOpen((current) => !current)}>
+        <button className="button button-primary deal-create-toggle" type="button" disabled={serviceDeal && !serviceName} onClick={() => setProposalOpen((current) => !current)}>
           {proposalOpen ? "Cancel proposal" : "Propose a deal"}
         </button>
       </header>
+      {serviceDeal && <p className="deal-service-context">Service: <strong>{serviceDisplayName || "Choose a service above to propose a deal."}</strong></p>}
       {proposalOpen && (
         <form className="deal-proposal-form" onSubmit={createDeal}>
           <label htmlFor={`deal-proposal-${businessId}`}>Describe the proposed deal</label>
@@ -1092,13 +3002,15 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
                 ref={deal.id === focusedDealId ? focusedDealRef : undefined}
               >
                 <header className="deal-card-heading">
-                  <span className="deal-status">{statusLabel(deal.status)}</span>
+                  <span className="deal-status">{statusLabel(deal.status, deal.autoAccepted)}</span>
                   <time dateTime={deal.updatedAt}>{new Date(deal.updatedAt).toLocaleDateString()}</time>
                 </header>
                 <p className="deal-proposal">{deal.proposal}</p>
+                {serviceDeal && deal.serviceName && <span className="service-message-tag deal-service-tag">{deal.serviceName === "Other" ? otherServiceDisplayName : deal.serviceName}</span>}
                 <span className="deal-created-by">
-                  Proposed by {isCreator ? "you" : accountType === "user" ? businessName : "the customer"}
+                  Proposed by {isCreator ? "you" : otherPartyName}
                 </span>
+                <ProductOrderDetails deal={deal} />
                 {canRespond && (
                   <div className="deal-actions">
                     <button className="button button-primary" type="button" onClick={() => updateStatus(deal.id, "accept")}>Accept proposal</button>
@@ -1109,11 +3021,12 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
                   <>
                     <div className="deal-thread">
                       <h3>Deal chat</h3>
-                      {deal.messages.map((message) => {
+                      {(Array.isArray(deal.messages) ? deal.messages : []).map((message) => {
                         const ownMessage = message.senderType === creatorType;
                         return (
                           <div className={`deal-message${ownMessage ? " own" : ""}`} key={message.id}>
-                            <span>{ownMessage ? "You" : accountType === "user" ? businessName : "Customer"}</span>
+                            <span>{ownMessage ? "You" : accountType === "user" ? businessName : accountType === "serviceCustomer" ? businessName : "Customer"}</span>
+                            {serviceDeal && <span className="service-message-tag">{deal.serviceName === "Other" ? otherServiceDisplayName : deal.serviceName || "Service deal"}</span>}
                             <p>{message.content}</p>
                             <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString()}</time>
                           </div>
@@ -1157,13 +3070,22 @@ function DealCenter({ accountType, userId, businessId, businessName, focusedDeal
   );
 }
 
-function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
+function ActiveDealsView({ accountType, accountId, onOpenDeal, otherService = "" }) {
   const [deals, setDeals] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [sendingDealId, setSendingDealId] = useState("");
-  const dealsUrl = accountType === "business" ? "/api/business/deals" : "/api/neighborhood/deals";
+  const isServiceProvider = accountType === "serviceProvider";
+  const isServiceCustomer = accountType === "serviceCustomer";
+  const isServiceDeal = isServiceProvider || isServiceCustomer;
+  const dealsUrl = accountType === "business"
+    ? "/api/business/deals"
+    : isServiceProvider
+      ? "/api/service-providers/provider-deals"
+      : isServiceCustomer
+        ? "/api/service-providers/deals"
+        : "/api/neighborhood/deals";
   const activeDealsUrl = `${dealsUrl}/active`;
 
   useEffect(() => {
@@ -1186,6 +3108,15 @@ function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
     socket.on("business-deal:update", (deal) => {
       const belongsToAccount = accountType === "business"
         ? deal.businessId === accountId
+        : isServiceProvider
+          ? deal.serviceProviderId === accountId
+          : deal.userId === accountId;
+      if (belongsToAccount) refreshDeals();
+    });
+    socket.on("service-deal:update", (deal) => {
+      if (!isServiceDeal) return;
+      const belongsToAccount = isServiceProvider
+        ? deal.serviceProviderId === accountId
         : deal.userId === accountId;
       if (belongsToAccount) refreshDeals();
     });
@@ -1235,9 +3166,11 @@ function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
     }
   }
 
-  const partyName = (deal) => accountType === "business"
+  const partyName = (deal) => accountType === "business" || isServiceProvider
     ? deal.customer?.name || "Customer"
-    : deal.business?.businessName || "Business";
+    : isServiceCustomer
+      ? deal.provider?.name || "Service provider"
+      : deal.business?.businessName || "Business";
 
   return (
     <section className="active-deals-page" aria-labelledby="active-deals-heading">
@@ -1260,25 +3193,33 @@ function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
       ) : (
         <div className="active-deals-list">
           {deals.map((deal) => {
-            const lastMessage = deal.messages.at(-1);
+            const lastMessage = Array.isArray(deal.messages) ? deal.messages.at(-1) : null;
             const lastMessageText = lastMessage?.content || deal.proposal;
-            const subject = deal.proposal.split(/\r?\n/, 1)[0];
-            const canRespond = deal.status === "pending" && deal.creatorType !== accountType;
+            const subject = (typeof deal.proposal === "string" ? deal.proposal : "Service deal").split(/\r?\n/, 1)[0];
+            const currentCreatorType = isServiceCustomer ? "user" : accountType;
+            const canRespond = deal.status === "pending" && deal.creatorType !== currentCreatorType;
             return (
               <article className="active-deal-card" key={deal.id}>
                 <button className="active-deal-summary" type="button" onClick={() => onOpenDeal(deal)}>
                   <span className="active-deal-summary-heading">
                     <strong>{partyName(deal)}</strong>
                     <span className={`deal-status active-deal-status-${deal.status}`}>
-                      {deal.status === "pending" ? "Awaiting response" : "Accepted · Active"}
+                      {deal.status === "pending" ? "Awaiting response" : deal.autoAccepted ? "Order · Auto-accepted" : "Accepted · Active"}
                     </span>
                   </span>
                   <span className="active-deal-subject"><b>Subject:</b> {subject}</span>
+                  {isServiceDeal && deal.serviceName && <span className="service-message-tag">{deal.serviceName === "Other" ? deal.provider?.otherService || otherService || "Other" : deal.serviceName}</span>}
+                  {Array.isArray(deal.orderItems) && (
+                    <span className="active-deal-order-summary">
+                      Product order · {deal.orderItems.length} {deal.orderItems.length === 1 ? "product" : "products"} · ₹{Number(deal.orderTotal || 0).toFixed(2)}
+                    </span>
+                  )}
                   <span className="active-deal-last-message">
                     <b>Last message:</b> {lastMessageText}
                   </span>
                   <span className="active-deal-open-hint">Open full deal →</span>
                 </button>
+                <ProductOrderDetails deal={deal} />
                 {canRespond && (
                   <div className="deal-actions active-deal-actions">
                     <button className="button button-primary" type="button" onClick={() => updateStatus(deal.id, "accept")}>Accept proposal</button>
@@ -1305,6 +3246,52 @@ function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
             );
           })}
         </div>
+      )}
+    </section>
+  );
+}
+
+function ProductOrderDetails({ deal }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!Array.isArray(deal.orderItems) || deal.orderItems.length === 0) return null;
+
+  return (
+    <section className="product-order-details" aria-label="Products in this deal">
+      <header>
+        <div>
+          <strong>Product order · auto-accepted</strong>
+          <span>{deal.orderItems.length} {deal.orderItems.length === 1 ? "product" : "products"} · ₹{Number(deal.orderTotal || 0).toFixed(2)}</span>
+        </div>
+        <button
+          className="button button-outline"
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {expanded ? "Hide products" : "View products"}
+        </button>
+      </header>
+      {expanded && (
+        <ul>
+          {deal.orderItems.map((item) => (
+            <li key={item.productId}>
+              <span className="product-order-item-name">
+                <strong>{item.name}</strong>
+                <span>Qty {item.quantity}</span>
+                {item.discountPercent > 0 && <span>{item.discountPercent}% discount</span>}
+              </span>
+              <span className="product-order-item-price">
+                {item.discountPercent > 0 && <del>₹{Number(item.originalUnitPrice).toFixed(2)}</del>}
+                <strong>₹{Number(item.unitPrice).toFixed(2)} each</strong>
+                <span>₹{Number(item.lineTotal).toFixed(2)}</span>
+              </span>
+            </li>
+          ))}
+          <li className="product-order-total">
+            <strong>Agreed total</strong>
+            <strong>₹{Number(deal.orderTotal || 0).toFixed(2)}</strong>
+          </li>
+        </ul>
       )}
     </section>
   );
@@ -1341,6 +3328,7 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
   const [selectedBusiness, setSelectedBusiness] = useState(null);
   const [businessChatMode, setBusinessChatMode] = useState("messages");
   const [focusedBusinessDealId, setFocusedBusinessDealId] = useState(null);
+  const [cartDealNotice, setCartDealNotice] = useState("");
   const [businessMessages, setBusinessMessages] = useState([]);
   const [businessDraft, setBusinessDraft] = useState("");
   const [businessChatError, setBusinessChatError] = useState("");
@@ -1706,6 +3694,15 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
     navigateToView("businessChats");
   }
 
+  function openPlacedCartDeal(deal, business, notice = "") {
+    setSelectedBusiness(business);
+    setFocusedBusinessDealId(deal.id);
+    setBusinessChatMode("deals");
+    setCartDealNotice(notice);
+    setBusinessChatError("");
+    navigateToView("businessChats");
+  }
+
   async function sendBusinessMessage(event) {
     event.preventDefault();
     const content = businessDraft.trim();
@@ -1927,6 +3924,13 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
             Business
           </button>
           <button
+            className={`nav-button${activeView === "services" ? " active" : ""}`}
+            type="button"
+            onClick={() => navigateToView("services")}
+          >
+            Services
+          </button>
+          <button
             className={`nav-button${activeView === "profile" ? " active" : ""}`}
             type="button"
             onClick={() => navigateToView("profile")}
@@ -1949,6 +3953,12 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
               <p className="eyebrow">Local business</p>
               <h1>Explore businesses in your area.</h1>
               <p className="community-subtitle">Discover local businesses, manage chats, and follow your deals.</p>
+            </>
+          ) : activeView === "services" ? (
+            <>
+              <p className="eyebrow">Local services</p>
+              <h1>Find skilled help in your area.</h1>
+              <p className="community-subtitle">Discover nearby professionals, chat, and agree on a service deal.</p>
             </>
           ) : (
             <>
@@ -2153,11 +4163,18 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
       ) : activeView === "businesses" ? (
         <BusinessDirectoryView
           businesses={businesses}
+          customerId={user.id}
           loading={loadingBusinesses}
           error={businessChatError}
           search={businessSearch}
           onSearch={setBusinessSearch}
           onOpenChat={openBusinessChat}
+          onCartDealPlaced={openPlacedCartDeal}
+          onBusinessRatingUpdated={(businessId, summary) => {
+            setBusinesses((current) => current.map((business) =>
+              business.id === businessId ? { ...business, ...summary } : business,
+            ));
+          }}
         />
       ) : activeView === "activeDeals" ? (
         <ActiveDealsView
@@ -2175,6 +4192,7 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
           <button className="button button-outline" type="button" onClick={() => setBusinessChatMode("messages")}>
             ← Business messages
           </button>
+          {cartDealNotice && <p className="profile-feedback" role="status">{cartDealNotice}</p>}
           <DealCenter
             accountType="user"
             userId={user.id}
@@ -2204,6 +4222,8 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSect
           onSendMessage={sendBusinessMessage}
           onCreateDeal={createDealFromMessage}
         />
+      ) : activeView === "services" ? (
+        <ServicesMarketplace user={user} />
       ) : activeView === "connections" ? (
         <section className="connections-page" aria-label="Find and connect with people nearby">
           <header className="connections-heading">
@@ -2647,9 +4667,13 @@ function App() {
   const [accountType, setAccountType] = useState("neighborhood");
   const [form, setForm] = useState(emptyForm);
   const [businessForm, setBusinessForm] = useState(emptyBusinessForm);
+  const [serviceProviderForm, setServiceProviderForm] = useState(emptyServiceProviderForm);
+  const [serviceCatalog, setServiceCatalog] = useState([]);
+  const [serviceSearch, setServiceSearch] = useState("");
   const [user, setUser] = useState(null);
   const [lastSection, setLastSection] = useState("community");
   const [business, setBusiness] = useState(null);
+  const [serviceProvider, setServiceProvider] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [locationStatus, setLocationStatus] = useState("");
@@ -2674,10 +4698,24 @@ function App() {
             setAccountType("business");
           })
           .catch((businessError) => {
-            if (businessError.status !== 401) setError(businessError.message);
+            if (businessError.status !== 401) {
+              setError(businessError.message);
+              return;
+            }
+            request("/api/service-providers/me")
+              .then(({ serviceProvider: currentProvider }) => {
+                setServiceProvider(currentProvider);
+                setAccountType("serviceProvider");
+              })
+              .catch((providerError) => {
+                if (providerError.status !== 401) setError(providerError.message);
+              });
           });
       })
       .finally(() => setLoading(false));
+    request("/api/service-providers/catalog")
+      .then(({ services }) => setServiceCatalog(services))
+      .catch((catalogError) => setError(catalogError.message));
   }, []);
 
   function updateField(event) {
@@ -2705,13 +4743,60 @@ function App() {
     if (name === "pincode") setLocationStatus("");
   }
 
+  function updateServiceProviderField(event) {
+    const { name, value } = event.target;
+    setServiceProviderForm((current) => ({ ...current, [name]: value }));
+    if (name === "pincode") setLocationStatus("");
+  }
+
   function updateCredentialField(event) {
     const { name, value } = event.target;
     if (accountType === "business") {
       setBusinessForm((current) => ({ ...current, [name]: value }));
+    } else if (accountType === "serviceProvider") {
+      setServiceProviderForm((current) => ({ ...current, [name]: value }));
     } else {
       setForm((current) => ({ ...current, [name]: value }));
     }
+  }
+
+  function detectServiceProviderLocation() {
+    setError("");
+    setLocationStatus("Waiting for your location permission…");
+    if (!navigator.geolocation) {
+      setLocationStatus("Location is not supported by this browser. Enter your pincode instead.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      async ({ coords }) => {
+        setServiceProviderForm((current) => ({
+          ...current,
+          locationConsent: true,
+          latitude: String(coords.latitude),
+          longitude: String(coords.longitude),
+        }));
+        try {
+          const result = await request(
+            `/api/location/reverse?lat=${encodeURIComponent(coords.latitude)}&lon=${encodeURIComponent(coords.longitude)}`,
+          );
+          setServiceProviderForm((current) => ({ ...current, pincode: result.pincode || current.pincode }));
+          setLocationStatus(result.pincode
+            ? `Pincode found: ${result.pincode}. Your coordinates will be saved only with your permission.`
+            : "Location saved with your permission. Enter your pincode manually.");
+        } catch (locationError) {
+          setLocationStatus(`${locationError.message} You can enter your pincode manually.`);
+        }
+      },
+      (locationError) => {
+        const messages = {
+          1: "Location permission wasn’t granted. Enter your pincode instead.",
+          2: "Your location couldn’t be determined. Enter your pincode instead.",
+          3: "Location lookup timed out. Enter your pincode instead.",
+        };
+        setLocationStatus(messages[locationError.code] || "Location lookup failed. Enter your pincode instead.");
+      },
+      { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 },
+    );
   }
 
   function detectLocation() {
@@ -2812,7 +4897,25 @@ function App() {
     setSubmitting(true);
 
     try {
-      if (accountType === "business" && mode === "signup") {
+      if (accountType === "serviceProvider" && mode === "signup") {
+        const result = await request("/api/service-providers/signup", {
+          method: "POST",
+          body: JSON.stringify({
+            ...serviceProviderForm,
+            latitude: serviceProviderForm.locationConsent ? Number(serviceProviderForm.latitude) : null,
+            longitude: serviceProviderForm.locationConsent ? Number(serviceProviderForm.longitude) : null,
+          }),
+        });
+        setServiceProvider(result.serviceProvider);
+        setServiceProviderForm((current) => ({ ...current, password: "" }));
+      } else if (accountType === "serviceProvider") {
+        const result = await request("/api/service-providers/signin", {
+          method: "POST",
+          body: JSON.stringify({ email: serviceProviderForm.email, password: serviceProviderForm.password }),
+        });
+        setServiceProvider(result.serviceProvider);
+        setServiceProviderForm((current) => ({ ...current, password: "" }));
+      } else if (accountType === "business" && mode === "signup") {
         const result = await request("/api/business/signup", {
           method: "POST",
           body: JSON.stringify({
@@ -2886,8 +4989,10 @@ function App() {
       await request("/api/auth/signout", { method: "POST" });
       setUser(null);
       setBusiness(null);
+      setServiceProvider(null);
       setForm(emptyForm);
       setBusinessForm(emptyBusinessForm);
+      setServiceProviderForm(emptyServiceProviderForm);
       setMode("signin");
     } catch (signOutError) {
       setError(signOutError.message);
@@ -2927,9 +5032,29 @@ function App() {
       />
     );
   }
+  if (serviceProvider) {
+    return (
+      <ServiceProviderDashboard
+        serviceProvider={serviceProvider}
+        serviceCatalog={serviceCatalog}
+        onServiceProviderUpdated={setServiceProvider}
+        onSignOut={async () => {
+          try {
+            await request("/api/service-providers/signout", { method: "POST" });
+            setServiceProvider(null);
+            setServiceProviderForm(emptyServiceProviderForm);
+            setMode("signin");
+          } catch (signOutError) {
+            setError(signOutError.message);
+          }
+        }}
+      />
+    );
+  }
 
   const isSignup = mode === "signup";
   const isBusiness = accountType === "business";
+  const isServiceProvider = accountType === "serviceProvider";
 
   return (
     <main className="auth-page">
@@ -2973,10 +5098,19 @@ function App() {
               Business
             </button>
             <button
-              className={!isBusiness ? "account-type-tab active" : "account-type-tab"}
+              className={isServiceProvider ? "account-type-tab active" : "account-type-tab"}
               type="button"
               role="tab"
-              aria-selected={!isBusiness}
+              aria-selected={isServiceProvider}
+              onClick={() => changeAccountType("serviceProvider")}
+            >
+              Service provider
+            </button>
+            <button
+              className={!isBusiness && !isServiceProvider ? "account-type-tab active" : "account-type-tab"}
+              type="button"
+              role="tab"
+              aria-selected={!isBusiness && !isServiceProvider}
               onClick={() => changeAccountType("neighborhood")}
             >
               Neighborhood
@@ -2985,18 +5119,26 @@ function App() {
           <p className="eyebrow form-eyebrow">
             {isBusiness
               ? isSignup ? "Create your business profile" : "Business portal"
-              : isSignup ? "Join your neighborhood" : "Welcome back"}
+              : isServiceProvider
+                ? isSignup ? "Join as a service provider" : "Service provider portal"
+                : isSignup ? "Join your neighborhood" : "Welcome back"}
           </p>
           <h2>
             {isBusiness
               ? isSignup ? "Bring your business closer." : "Welcome back."
-              : isSignup ? "Make yourself at home." : "Good to see you again."}
+              : isServiceProvider
+                ? isSignup ? "Bring your skills nearby." : "Welcome back."
+                : isSignup ? "Make yourself at home." : "Good to see you again."}
           </h2>
           <p className="form-intro">
             {isBusiness
               ? isSignup
                 ? "Introduce your business to the community and showcase what you offer."
                 : "Sign in to manage your business profile and photos."
+              : isServiceProvider
+                ? isSignup
+                  ? "List your services so nearby customers can contact you and agree on a deal."
+                  : "Sign in to update your service profile and manage customer conversations."
               : isSignup
               ? "Create your profile and meet the people around you."
               : "Sign in to pick up where your neighborhood left off."}
@@ -3098,7 +5240,73 @@ function App() {
                   <span className="field-hint">JPG, PNG, or WebP, up to 4 MB each. Add shop, product, or portfolio photos.</span>
                 </div>
               </>
-            ) : !isBusiness && isSignup ? (
+            ) : isServiceProvider && isSignup ? (
+              <>
+                <div className="field">
+                  <label htmlFor="serviceProviderName">Your name <span className="required">*</span></label>
+                  <input id="serviceProviderName" name="name" autoComplete="name" maxLength="80" placeholder="Your full name" value={serviceProviderForm.name} onChange={updateServiceProviderField} required />
+                </div>
+                <div className="field-row">
+                  <div className="field">
+                    <label htmlFor="serviceProviderPhone">Phone number <span className="required">*</span></label>
+                    <input id="serviceProviderPhone" name="phone" type="tel" autoComplete="tel" maxLength="20" placeholder="+91 98765 43210" value={serviceProviderForm.phone} onChange={updateServiceProviderField} required />
+                  </div>
+                  <div className="field">
+                    <label htmlFor="serviceProviderExperience">Years of experience <span className="optional">Optional</span></label>
+                    <input id="serviceProviderExperience" name="yearsExperience" type="number" min="0" max="80" value={serviceProviderForm.yearsExperience} onChange={updateServiceProviderField} />
+                  </div>
+                </div>
+                <div className="field">
+                  <div className="label-line">
+                    <label htmlFor="serviceProviderPincode">Area pincode <span className="required">*</span></label>
+                    <button className="location-button" type="button" onClick={detectServiceProviderLocation}>
+                      <span aria-hidden="true">⌖</span> Use my location
+                    </button>
+                  </div>
+                  <input id="serviceProviderPincode" name="pincode" autoComplete="postal-code" inputMode="numeric" maxLength="6" pattern="[0-9]{6}" placeholder="6-digit Indian pincode" value={serviceProviderForm.pincode} onChange={updateServiceProviderField} required />
+                  <span className="field-hint">Only customers in your pincode can find your service profile.</span>
+                  {locationStatus && <span className="inline-status" role="status">{locationStatus}</span>}
+                </div>
+                <div className="field">
+                  <label>Services you provide <span className="required">*</span></label>
+                  <ServiceCatalogPicker
+                    catalog={serviceCatalog}
+                    selectedServices={serviceProviderForm.services}
+                    onServicesChange={(update) => setServiceProviderForm((current) => {
+                      const services = typeof update === "function" ? update(current.services) : update;
+                      return {
+                        ...current,
+                        services,
+                        serviceDetails: Object.fromEntries(
+                          Object.entries(current.serviceDetails).filter(([service]) => services.includes(service)),
+                        ),
+                      };
+                    })}
+                    otherService={serviceProviderForm.otherService}
+                    onOtherServiceChange={(otherService) => setServiceProviderForm((current) => ({ ...current, otherService }))}
+                    search={serviceSearch}
+                    onSearchChange={setServiceSearch}
+                  />
+                </div>
+                <ServiceDetailsEditor
+                  services={serviceProviderForm.services}
+                  serviceDetails={serviceProviderForm.serviceDetails}
+                  otherService={serviceProviderForm.otherService}
+                  onDetailsChange={(update) => setServiceProviderForm((current) => ({
+                    ...current,
+                    serviceDetails: typeof update === "function" ? update(current.serviceDetails) : update,
+                  }))}
+                />
+                <div className="field">
+                  <label htmlFor="serviceProviderExpertise">Your expertise <span className="optional">Optional</span></label>
+                  <textarea id="serviceProviderExpertise" name="expertise" rows="3" maxLength="2000" placeholder="Training, experience, or specialist skills" value={serviceProviderForm.expertise} onChange={updateServiceProviderField} />
+                </div>
+                <div className="field">
+                  <label htmlFor="serviceProviderOffering">What you offer <span className="optional">Optional</span></label>
+                  <textarea id="serviceProviderOffering" name="description" rows="3" maxLength="2000" placeholder="Services, availability, and what customers can expect" value={serviceProviderForm.description} onChange={updateServiceProviderField} />
+                </div>
+              </>
+            ) : !isBusiness && !isServiceProvider && isSignup ? (
               <>
                 <div className="field">
                   <label htmlFor="name">Your name <span className="required">*</span></label>
@@ -3137,12 +5345,12 @@ function App() {
               </>
             ) : null}
             <div className="field">
-              <label htmlFor="email">{isBusiness ? "Business email" : "Email address"} <span className="required">*</span></label>
-              <input id="email" name="email" type="email" autoComplete="email" maxLength="254" placeholder={isBusiness ? "business@example.com" : "you@example.com"} value={isBusiness ? businessForm.email : form.email} onChange={updateCredentialField} required />
+              <label htmlFor="email">{isBusiness ? "Business email" : isServiceProvider ? "Email address" : "Email address"} <span className="required">*</span></label>
+              <input id="email" name="email" type="email" autoComplete="email" maxLength="254" placeholder={isBusiness ? "business@example.com" : "you@example.com"} value={isBusiness ? businessForm.email : isServiceProvider ? serviceProviderForm.email : form.email} onChange={updateCredentialField} required />
             </div>
             <div className="field">
-              <label htmlFor="password">{isBusiness ? "Business password" : "Password"} <span className="required">*</span></label>
-              <input id="password" name="password" type="password" autoComplete={isSignup ? "new-password" : "current-password"} minLength={isSignup ? 8 : undefined} maxLength="72" placeholder={isSignup ? "At least 8 characters" : "Your password"} value={isBusiness ? businessForm.password : form.password} onChange={updateCredentialField} required />
+              <label htmlFor="password">{isBusiness ? "Business password" : isServiceProvider ? "Password" : "Password"} <span className="required">*</span></label>
+              <input id="password" name="password" type="password" autoComplete={isSignup ? "new-password" : "current-password"} minLength={isSignup ? 8 : undefined} maxLength="72" placeholder={isSignup ? "At least 8 characters" : "Your password"} value={isBusiness ? businessForm.password : isServiceProvider ? serviceProviderForm.password : form.password} onChange={updateCredentialField} required />
               {isSignup && <span className="field-hint">Use at least 8 characters.</span>}
             </div>
 
@@ -3154,7 +5362,13 @@ function App() {
               </p>
             )}
 
-            {isSignup && !isBusiness && (
+            {isSignup && isServiceProvider && (
+              <p className="privacy-note">
+                Location sharing is optional. If you choose “Use my location,” your coordinates are saved with your service profile; your pincode is used to match you with local customers.
+              </p>
+            )}
+
+            {isSignup && !isBusiness && !isServiceProvider && (
               <p className="privacy-note">
                 Location access is optional. If you allow it, we use it once to find your pincode; your coordinates are not stored.
               </p>
@@ -3169,7 +5383,9 @@ function App() {
           <p className="switch-copy">
             {isBusiness
               ? isSignup ? "Already have a business account?" : "New to the business portal?"
-              : isSignup ? "Already part of the neighborhood?" : "New around here?"}{" "}
+              : isServiceProvider
+                ? isSignup ? "Already registered as a service provider?" : "New service provider?"
+                : isSignup ? "Already part of the neighborhood?" : "New around here?"}{" "}
             <button type="button" onClick={() => changeMode(isSignup ? "signin" : "signup")}>
               {isSignup ? "Sign in" : "Create an account"}
             </button>

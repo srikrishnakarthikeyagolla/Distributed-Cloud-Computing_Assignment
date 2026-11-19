@@ -16,6 +16,12 @@ import {
   findBusinessesByPincode,
 } from "../models/Business.js";
 import {
+  findBusinessProduct,
+  listBusinessProducts,
+  reserveBusinessProductStock,
+  restoreBusinessProductStock,
+} from "../models/BusinessProduct.js";
+import {
   createBusinessMessage,
   listBusinessConversation,
   listBusinessMessagesForUser,
@@ -28,9 +34,15 @@ import {
   listBusinessDealsForUser,
   updateBusinessDealStatus,
 } from "../models/BusinessDeal.js";
+import {
+  listAllBusinessReviews,
+  listBusinessReviews,
+  saveBusinessReview,
+} from "../models/BusinessReview.js";
 
 const router = Router();
 const businessPhotoDirectory = fileURLToPath(new URL("../../data/business-photos/", import.meta.url));
+const businessProductPhotoDirectory = fileURLToPath(new URL("../../data/business-product-photos/", import.meta.url));
 const messageRateLimit = rateLimit({
   windowMs: 60 * 1000,
   limit: 30,
@@ -156,6 +168,47 @@ function publicBusinessMessage(message) {
   };
 }
 
+function publicBusinessProduct(product) {
+  const { businessId, ...details } = product;
+  return {
+    ...details,
+    photoUrl: `/api/neighborhood/business-products/${encodeURIComponent(product.id)}/photo`,
+  };
+}
+
+function summarizeBusinessReviews(reviews) {
+  const distribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  for (const review of reviews) distribution[review.rating] += 1;
+  return {
+    averageRating: reviews.length
+      ? Number((reviews.reduce((total, review) => total + review.rating, 0) / reviews.length).toFixed(1))
+      : 0,
+    reviewCount: reviews.length,
+    distribution,
+  };
+}
+
+async function publicBusinessReviews(businessId) {
+  const reviews = await listBusinessReviews(businessId);
+  const publicReviews = await Promise.all(reviews.map(async (review) => {
+    const reviewer = await findUserById(review.userId);
+    return {
+      id: review.id,
+      rating: review.rating,
+      comment: review.comment,
+      reviewerName: reviewer?.visibility === "public" ? reviewer.name : "Verified customer",
+      createdAt: review.createdAt,
+      updatedAt: review.updatedAt,
+    };
+  }));
+  return { reviews: publicReviews, ...summarizeBusinessReviews(reviews) };
+}
+
+async function customerCanReviewBusiness(userId, businessId) {
+  const deals = await listBusinessDeals(userId, businessId);
+  return deals.some((deal) => deal.status === "accepted" || deal.status === "fulfilled");
+}
+
 function emitBusinessDealUpdate(request, deal) {
   request.app.get("io")
     ?.to(`business-conversation:${deal.userId}:${deal.businessId}`)
@@ -207,13 +260,118 @@ router.get("/businesses", requireAuth, async (request, response, next) => {
     if (!user) return response.status(401).json({ error: "Please sign in again." });
     const businesses = await findBusinessesByPincode(user.pincode);
     const query = typeof request.query.search === "string" ? request.query.search.trim().slice(0, 120) : "";
+    const matchedBusinesses = businesses
+      .map((business) => ({ business, score: businessSearchScore(business, query) }))
+      .filter(({ score }) => score >= 0)
+      .sort((left, right) => right.score - left.score || left.business.businessName.localeCompare(right.business.businessName))
+      .slice(0, 100);
+    const allReviews = await listAllBusinessReviews();
+    const reviewsByBusiness = new Map();
+    for (const review of allReviews) {
+      const current = reviewsByBusiness.get(review.businessId) || [];
+      current.push(review);
+      reviewsByBusiness.set(review.businessId, current);
+    }
     return response.json({
-      businesses: businesses
-        .map((business) => ({ business, score: businessSearchScore(business, query) }))
-        .filter(({ score }) => score >= 0)
-        .sort((left, right) => right.score - left.score || left.business.businessName.localeCompare(right.business.businessName))
-        .slice(0, 100)
-        .map(({ business }) => publicBusinessListing(business)),
+      businesses: matchedBusinesses.map(({ business }) => ({
+        ...publicBusinessListing(business),
+        ...summarizeBusinessReviews(reviewsByBusiness.get(business.id) || []),
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/businesses/:businessId/reviews", requireAuth, async (request, response, next) => {
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
+    const [reviewSummary, eligible, reviews] = await Promise.all([
+      publicBusinessReviews(pair.business.id),
+      customerCanReviewBusiness(pair.user.id, pair.business.id),
+      listBusinessReviews(pair.business.id),
+    ]);
+    return response.json({
+      ...reviewSummary,
+      canReview: eligible,
+      myReview: reviews.find((review) => review.userId === pair.user.id) || null,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/businesses/:businessId/reviews", requireAuth, async (request, response, next) => {
+  const rating = request.body?.rating;
+  const comment = typeof request.body?.comment === "string" ? request.body.comment.trim() : "";
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return response.status(400).json({ error: "Choose a rating from 1 to 5 stars." });
+  }
+  if (comment.length > 1500) {
+    return response.status(400).json({ error: "Review comments must be 1,500 characters or fewer." });
+  }
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
+    if (!(await customerCanReviewBusiness(pair.user.id, pair.business.id))) {
+      return response.status(403).json({ error: "Complete at least one accepted deal before reviewing this business." });
+    }
+    const savedReview = await saveBusinessReview({
+      businessId: pair.business.id,
+      userId: pair.user.id,
+      rating,
+      comment,
+    });
+    const summary = await publicBusinessReviews(pair.business.id);
+    return response.json({
+      ...summary,
+      canReview: true,
+      myReview: {
+        id: savedReview.id,
+        rating: savedReview.rating,
+        comment: savedReview.comment,
+        reviewerName: pair.user.name,
+        createdAt: savedReview.createdAt,
+        updatedAt: savedReview.updatedAt,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/businesses/:businessId/products", requireAuth, async (request, response, next) => {
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair || pair.business.isVisible === false) {
+      return response.status(404).json({ error: "That business is not available in your area." });
+    }
+    const products = await listBusinessProducts(pair.business.id);
+    return response.json({ products: products.map(publicBusinessProduct) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/business-products/:productId/photo", requireAuth, async (request, response, next) => {
+  try {
+    const product = await findBusinessProduct(request.params.productId);
+    if (!product) return response.status(404).json({ error: "Product photo not found." });
+    const pair = await getBusinessForUser(request.userId, product.businessId);
+    if (!pair || pair.business.isVisible === false) {
+      return response.status(404).json({ error: "Product photo not found." });
+    }
+    if (!/^[0-9a-f-]{36}\.(jpg|png|webp)$/i.test(product.photo)) {
+      return response.status(404).json({ error: "Product photo not found." });
+    }
+    const photoPath = join(businessProductPhotoDirectory, product.photo);
+    const mimeType = product.photo.endsWith(".png")
+      ? "image/png"
+      : product.photo.endsWith(".webp") ? "image/webp" : "image/jpeg";
+    response.type(mimeType);
+    return response.sendFile(photoPath, (error) => {
+      if (error && !response.headersSent) next(error);
     });
   } catch (error) {
     return next(error);
@@ -275,6 +433,65 @@ router.post("/businesses/:businessId/deals", requireAuth, messageRateLimit, asyn
       creatorType: "user",
       proposal: result.proposal,
     });
+    emitBusinessDealUpdate(request, deal);
+    return response.status(201).json({ deal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/businesses/:businessId/cart-deals", requireAuth, messageRateLimit, async (request, response, next) => {
+  const requestedItems = request.body?.items;
+  if (!Array.isArray(requestedItems) || requestedItems.length < 1 || requestedItems.length > 50) {
+    return response.status(400).json({ error: "Add between 1 and 50 different products to your cart." });
+  }
+  const quantities = new Map();
+  for (const item of requestedItems) {
+    if (
+      !item ||
+      typeof item.productId !== "string" ||
+      !Number.isInteger(item.quantity) ||
+      item.quantity < 1 ||
+      item.quantity > 99 ||
+      quantities.has(item.productId)
+    ) {
+      return response.status(400).json({ error: "Your cart contains an invalid product or quantity." });
+    }
+    quantities.set(item.productId, item.quantity);
+  }
+
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair || pair.business.isVisible === false) {
+      return response.status(404).json({ error: "That business is not available in your area." });
+    }
+
+    const reservation = await reserveBusinessProductStock(
+      pair.business.id,
+      [...quantities].map(([productId, quantity]) => ({ productId, quantity })),
+    );
+    if (reservation.error) return response.status(409).json({ error: reservation.error });
+
+    let deal;
+    try {
+      deal = await createBusinessDeal({
+        userId: pair.user.id,
+        businessId: pair.business.id,
+        creatorType: "user",
+        proposal: `Product order · ${reservation.orderItems.length} ${reservation.orderItems.length === 1 ? "item" : "items"} · ₹${reservation.orderTotal.toFixed(2)}`,
+        orderItems: reservation.orderItems,
+        orderTotal: reservation.orderTotal,
+        autoAccepted: true,
+      });
+    } catch (error) {
+      try {
+        await restoreBusinessProductStock(pair.business.id, reservation.reservations);
+      } catch (restoreError) {
+        return next(new AggregateError([error, restoreError], "Failed to create the deal and restore reserved product stock."));
+      }
+      return next(error);
+    }
+
     emitBusinessDealUpdate(request, deal);
     return response.status(201).json({ deal });
   } catch (error) {

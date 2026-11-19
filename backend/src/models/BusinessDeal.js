@@ -82,6 +82,33 @@ export function listBusinessDealsForBusiness(businessId) {
   }));
 }
 
+export function listServiceDeals(userId, serviceProviderId) {
+  return withDeals((deals) => ({
+    value: deals
+      .filter((deal) => deal.serviceProviderId === serviceProviderId && deal.userId === userId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    write: false,
+  }));
+}
+
+export function listServiceDealsForUser(userId) {
+  return withDeals((deals) => ({
+    value: deals
+      .filter((deal) => typeof deal.serviceProviderId === "string" && deal.userId === userId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    write: false,
+  }));
+}
+
+export function listServiceDealsForProvider(serviceProviderId) {
+  return withDeals((deals) => ({
+    value: deals
+      .filter((deal) => deal.serviceProviderId === serviceProviderId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+    write: false,
+  }));
+}
+
 export function findBusinessDealById(dealId) {
   return withDeals((deals) => ({
     value: deals.find((deal) => deal.id === dealId) ?? null,
@@ -89,19 +116,38 @@ export function findBusinessDealById(dealId) {
   }));
 }
 
-export function createBusinessDeal({ userId, businessId, creatorType, proposal }) {
+export function createBusinessDeal({
+  userId,
+  businessId,
+  serviceProviderId = null,
+  serviceName = null,
+  creatorType,
+  proposal,
+  orderItems = null,
+  orderTotal = null,
+  autoAccepted = false,
+}) {
   return withDeals((deals) => {
     const now = new Date().toISOString();
     const deal = {
       id: randomUUID(),
       userId,
       businessId,
+      ...(serviceProviderId ? { serviceProviderId } : {}),
+      ...(serviceName ? { serviceName } : {}),
       creatorType,
       proposal,
-      status: "pending",
+      status: autoAccepted ? "accepted" : "pending",
       messages: [],
       createdAt: now,
       updatedAt: now,
+      ...(orderItems ? {
+        kind: "product_order",
+        orderItems,
+        orderTotal,
+        autoAccepted,
+        acceptedAt: autoAccepted ? now : null,
+      } : {}),
     };
     deals.push(deal);
     return { value: deal, write: true };

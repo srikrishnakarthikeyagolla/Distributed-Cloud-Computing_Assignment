@@ -20,10 +20,16 @@ import {
   initializeBusinessDealStore,
   listBusinessDeals,
 } from "./models/BusinessDeal.js";
+import { initializeBusinessReviewStore } from "./models/BusinessReview.js";
+import { initializeBusinessProductStore } from "./models/BusinessProduct.js";
+import { initializeServiceProviderStore } from "./models/ServiceProvider.js";
+import { initializeServiceMessageStore } from "./models/ServiceMessage.js";
+import { initializeServiceReviewStore } from "./models/ServiceReview.js";
 import authRouter from "./routes/auth.js";
 import locationRouter from "./routes/location.js";
 import neighborhoodRouter from "./routes/neighborhood.js";
 import businessRouter from "./routes/business.js";
+import serviceProviderRouter from "./routes/serviceProviders.js";
 
 const app = express();
 const httpServer = createServer(app);
@@ -50,6 +56,7 @@ app.use("/api/auth", authRouter);
 app.use("/api/location", locationRouter);
 app.use("/api/neighborhood", neighborhoodRouter);
 app.use("/api/business", businessRouter);
+app.use("/api/service-providers", serviceProviderRouter);
 
 function conversationRoom(firstUserId, secondUserId) {
   return `conversation:${[firstUserId, secondUserId].sort().join(":")}`;
@@ -101,14 +108,16 @@ async function getSameAreaPair(currentUserId, recipientId) {
 
 io.use((socket, next) => {
   const cookies = parseCookies(socket.handshake.headers.cookie);
-  const token = cookies.business_session || cookies.session;
+  const token = cookies.service_provider_session || cookies.business_session || cookies.session;
   if (!token) return next(new Error("Authentication required"));
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     if (typeof payload === "string" || typeof payload.sub !== "string") {
       return next(new Error("Invalid session"));
     }
-    socket.accountType = payload.accountType === "business" ? "business" : "user";
+    socket.accountType = payload.accountType === "serviceProvider"
+      ? "serviceProvider"
+      : payload.accountType === "business" ? "business" : "user";
     socket.accountId = payload.sub;
     return next();
   } catch {
@@ -118,6 +127,7 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   socket.join(`${socket.accountType}:${socket.accountId}`);
+  if (socket.accountType === "serviceProvider") socket.join(`service-provider:${socket.accountId}`);
 
   socket.on("chat:join", async (recipientId, acknowledge = () => {}) => {
     try {
@@ -297,6 +307,11 @@ async function startServer() {
   await initializeBusinessStore();
   await initializeBusinessMessageStore();
   await initializeBusinessDealStore();
+  await initializeBusinessReviewStore();
+  await initializeBusinessProductStore();
+  await initializeServiceProviderStore();
+  await initializeServiceMessageStore();
+  await initializeServiceReviewStore();
   console.log("Using local JSON stores at backend/data/.");
 
   httpServer.listen(port, () => {

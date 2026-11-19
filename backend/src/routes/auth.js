@@ -185,6 +185,12 @@ router.post("/signup", authRateLimit, async (request, response, next) => {
       sameSite: "lax",
       path: "/",
     });
+    response.clearCookie("service_provider_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
     setSessionCookie(response, user.id);
     setLastSectionCookie(response, "community");
     return response.status(201).json({ user: publicUser(user), lastSection: "community" });
@@ -213,6 +219,12 @@ router.post("/signin", authRateLimit, async (request, response, next) => {
       sameSite: "lax",
       path: "/",
     });
+    response.clearCookie("service_provider_session", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
     setSessionCookie(response, user.id);
     return response.json({ user: publicUser(user), lastSection: getLastSection(request) });
   } catch (error) {
@@ -221,12 +233,14 @@ router.post("/signin", authRateLimit, async (request, response, next) => {
 });
 
 router.post("/signout", (_request, response) => {
-  response.clearCookie("session", {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-  });
+  for (const cookieName of ["session", "business_session", "service_provider_session"]) {
+    response.clearCookie(cookieName, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
+  }
   return response.json({ message: "Signed out." });
 });
 
