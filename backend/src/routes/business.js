@@ -20,6 +20,14 @@ import {
   listBusinessConversation,
   listBusinessMessagesForBusiness,
 } from "../models/BusinessMessage.js";
+import {
+  addBusinessDealMessage,
+  createBusinessDeal,
+  findBusinessDealById,
+  listBusinessDeals,
+  listBusinessDealsForBusiness,
+  updateBusinessDealStatus,
+} from "../models/BusinessDeal.js";
 import { requireBusinessAuth } from "../middleware/requireBusinessAuth.js";
 
 const router = Router();
@@ -183,6 +191,42 @@ function handlePhotoUpload(request, response, next) {
   });
 }
 
+function validateDealProposal(input) {
+  const proposal = typeof input === "string" ? input.trim() : "";
+  if (!proposal || proposal.length > 2000) {
+    return { error: "Describe the proposed deal in 1 to 2,000 characters." };
+  }
+  return { proposal };
+}
+
+function emitBusinessDealUpdate(request, deal) {
+  request.app.get("io")
+    ?.to(`business-conversation:${deal.userId}:${deal.businessId}`)
+    .to(`user:${deal.userId}`)
+    .to(`business:${deal.businessId}`)
+    .emit("business-deal:update", deal);
+}
+
+async function findBusinessConversation(businessId, userId) {
+  const [business, user] = await Promise.all([
+    findBusinessById(businessId),
+    findUserById(userId),
+  ]);
+  if (
+    !business ||
+    !user ||
+    business.pincode.trim().toUpperCase() !== user.pincode.trim().toUpperCase()
+  ) return null;
+  return { business, user };
+}
+
+async function authorizeBusinessDeal(businessId, dealId) {
+  const deal = await findBusinessDealById(dealId);
+  if (!deal || deal.businessId !== businessId) return null;
+  const pair = await findBusinessConversation(businessId, deal.userId);
+  return pair ? { ...pair, deal } : null;
+}
+
 router.post("/signup", signupLimit, async (request, response, next) => {
   const result = validateBusiness(request.body ?? {});
   if (result.error) return response.status(400).json({ error: result.error });
@@ -255,11 +299,24 @@ router.put("/visibility", requireBusinessAuth, async (request, response, next) =
 router.get("/conversations", requireBusinessAuth, async (request, response, next) => {
   try {
     const messages = await listBusinessMessagesForBusiness(request.businessId);
+    const deals = await listBusinessDealsForBusiness(request.businessId);
     const conversations = new Map();
     for (const message of messages) {
       const current = conversations.get(message.userId);
       if (!current || current.lastMessage.createdAt < message.createdAt) {
         conversations.set(message.userId, { lastMessage: message });
+      }
+    }
+    for (const deal of deals) {
+      const current = conversations.get(deal.userId);
+      if (!current || current.lastMessage.createdAt < deal.updatedAt) {
+        conversations.set(deal.userId, {
+          lastMessage: {
+            content: deal.messages.at(-1)?.content || deal.proposal,
+            createdAt: deal.updatedAt,
+            type: "deal",
+          },
+        });
       }
     }
     const results = await Promise.all(
@@ -282,6 +339,105 @@ router.get("/conversations", requireBusinessAuth, async (request, response, next
   }
 });
 
+router.get("/conversations/:userId/deals", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const pair = await findBusinessConversation(request.businessId, request.params.userId);
+    if (!pair) return response.status(404).json({ error: "That customer is not available in your area." });
+    const deals = await listBusinessDeals(pair.user.id, pair.business.id);
+    if (
+      pair.business.isVisible === false &&
+      deals.length === 0 &&
+      (await listBusinessConversation(pair.user.id, pair.business.id)).length === 0
+    ) return response.status(404).json({ error: "That conversation is not available." });
+    return response.json({ deals });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/deals/active", requireBusinessAuth, async (request, response, next) => {
+  try {
+    const deals = (await listBusinessDealsForBusiness(request.businessId))
+      .filter((deal) => deal.status === "pending" || deal.status === "accepted")
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const activeDeals = await Promise.all(deals.map(async (deal) => {
+      const user = await findUserById(deal.userId);
+      return user ? { ...deal, customer: { id: user.id, name: user.name } } : null;
+    }));
+    return response.json({ deals: activeDeals.filter(Boolean) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/conversations/:userId/deals", requireBusinessAuth, businessMessageLimit, async (request, response, next) => {
+  const result = validateDealProposal(request.body?.proposal);
+  if (result.error) return response.status(400).json({ error: result.error });
+  try {
+    const pair = await findBusinessConversation(request.businessId, request.params.userId);
+    if (!pair) return response.status(404).json({ error: "That customer is not available in your area." });
+    const [existingDeals, existingMessages] = await Promise.all([
+      listBusinessDeals(pair.user.id, pair.business.id),
+      listBusinessConversation(pair.user.id, pair.business.id),
+    ]);
+    if (existingMessages.length === 0 && existingDeals.length === 0) {
+      return response.status(404).json({ error: "The customer must start the conversation before you can propose a deal." });
+    }
+    const deal = await createBusinessDeal({
+      userId: pair.user.id,
+      businessId: pair.business.id,
+      creatorType: "business",
+      proposal: result.proposal,
+    });
+    emitBusinessDealUpdate(request, deal);
+    return response.status(201).json({ deal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/deals/:dealId/status", requireBusinessAuth, async (request, response, next) => {
+  const action = request.body?.action;
+  if (!["accept", "pass", "fulfill"].includes(action)) {
+    return response.status(400).json({ error: "Choose an available deal action." });
+  }
+  try {
+    const authorized = await authorizeBusinessDeal(request.businessId, request.params.dealId);
+    if (!authorized) return response.status(404).json({ error: "That deal could not be found." });
+    const { deal } = authorized;
+    if (action === "accept" || action === "pass") {
+      if (deal.status !== "pending" || deal.creatorType === "business") {
+        return response.status(409).json({ error: "This proposal is no longer awaiting your response." });
+      }
+    } else if (deal.status !== "accepted") {
+      return response.status(409).json({ error: "Only an accepted deal can be marked fulfilled." });
+    }
+    const updatedDeal = await updateBusinessDealStatus(deal.id, action, "business");
+    if (!updatedDeal) return response.status(409).json({ error: "This deal has already changed and can no longer be updated." });
+    emitBusinessDealUpdate(request, updatedDeal);
+    return response.json({ deal: updatedDeal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/deals/:dealId/messages", requireBusinessAuth, businessMessageLimit, async (request, response, next) => {
+  const content = typeof request.body?.content === "string" ? request.body.content.trim() : "";
+  if (!content || content.length > 2000) {
+    return response.status(400).json({ error: "Messages must be between 1 and 2,000 characters." });
+  }
+  try {
+    const authorized = await authorizeBusinessDeal(request.businessId, request.params.dealId);
+    if (!authorized) return response.status(404).json({ error: "That deal could not be found." });
+    const result = await addBusinessDealMessage(authorized.deal.id, "business", content);
+    if (!result) return response.status(409).json({ error: "Deal chat is available while an accepted deal is active." });
+    emitBusinessDealUpdate(request, result.deal);
+    return response.status(201).json(result);
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get("/conversations/:userId", requireBusinessAuth, async (request, response, next) => {
   try {
     const [business, user] = await Promise.all([
@@ -292,7 +448,8 @@ router.get("/conversations/:userId", requireBusinessAuth, async (request, respon
       return response.status(404).json({ error: "That customer is not available in your area." });
     }
     const messages = await listBusinessConversation(user.id, business.id);
-    if (messages.length === 0) {
+    const deals = await listBusinessDeals(user.id, business.id);
+    if (messages.length === 0 && deals.length === 0) {
       return response.status(404).json({ error: "A customer must start the conversation before you can reply." });
     }
     return response.json({ messages });
@@ -314,7 +471,11 @@ router.post("/conversations/:userId", requireBusinessAuth, businessMessageLimit,
     if (!business || !user || business.pincode.trim().toUpperCase() !== user.pincode.trim().toUpperCase()) {
       return response.status(404).json({ error: "That customer is not available in your area." });
     }
-    if ((await listBusinessConversation(user.id, business.id)).length === 0) {
+    const [existingMessages, existingDeals] = await Promise.all([
+      listBusinessConversation(user.id, business.id),
+      listBusinessDeals(user.id, business.id),
+    ]);
+    if (existingMessages.length === 0 && existingDeals.length === 0) {
       return response.status(404).json({ error: "A customer must start the conversation before you can reply." });
     }
     const message = await createBusinessMessage({

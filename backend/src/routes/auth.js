@@ -110,6 +110,20 @@ function setSessionCookie(response, userId) {
   });
 }
 
+function getLastSection(request) {
+  return request.cookies.last_section === "business" ? "business" : "community";
+}
+
+function setLastSectionCookie(response, section) {
+  response.cookie("last_section", section, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: 365 * 24 * 60 * 60 * 1000,
+  });
+}
+
 function validateProfile(body, { includeCredentials }) {
   const input = body && typeof body === "object" ? body : {};
   const name = typeof input.name === "string" ? input.name.trim() : "";
@@ -172,7 +186,8 @@ router.post("/signup", authRateLimit, async (request, response, next) => {
       path: "/",
     });
     setSessionCookie(response, user.id);
-    return response.status(201).json({ user: publicUser(user) });
+    setLastSectionCookie(response, "community");
+    return response.status(201).json({ user: publicUser(user), lastSection: "community" });
   } catch (error) {
     if (error instanceof DuplicateEmailError) {
       return response.status(409).json({ error: "An account with this email already exists." });
@@ -199,7 +214,7 @@ router.post("/signin", authRateLimit, async (request, response, next) => {
       path: "/",
     });
     setSessionCookie(response, user.id);
-    return response.json({ user: publicUser(user) });
+    return response.json({ user: publicUser(user), lastSection: getLastSection(request) });
   } catch (error) {
     return next(error);
   }
@@ -215,6 +230,15 @@ router.post("/signout", (_request, response) => {
   return response.json({ message: "Signed out." });
 });
 
+router.post("/last-section", requireAuth, (request, response) => {
+  const { section } = request.body ?? {};
+  if (section !== "business" && section !== "community") {
+    return response.status(400).json({ error: "Choose the business or community section." });
+  }
+  setLastSectionCookie(response, section);
+  return response.json({ lastSection: section });
+});
+
 router.get("/me", requireAuth, async (request, response, next) => {
   try {
     const user = await findUserById(request.userId);
@@ -227,7 +251,7 @@ router.get("/me", requireAuth, async (request, response, next) => {
       });
       return response.status(401).json({ error: "Your account could not be found. Please sign in again." });
     }
-    return response.json({ user: publicUser(user) });
+    return response.json({ user: publicUser(user), lastSection: getLastSection(request) });
   } catch (error) {
     return next(error);
   }

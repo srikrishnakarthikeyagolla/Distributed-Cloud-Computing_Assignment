@@ -16,6 +16,10 @@ import {
   initializeBusinessMessageStore,
   listBusinessConversation,
 } from "./models/BusinessMessage.js";
+import {
+  initializeBusinessDealStore,
+  listBusinessDeals,
+} from "./models/BusinessDeal.js";
 import authRouter from "./routes/auth.js";
 import locationRouter from "./routes/location.js";
 import neighborhoodRouter from "./routes/neighborhood.js";
@@ -186,15 +190,21 @@ io.on("connection", (socket) => {
         return;
       }
       if (socket.accountType === "user" && pair.business.isVisible === false) {
-        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
-        if (existingMessages.length === 0) {
+        const [existingMessages, existingDeals] = await Promise.all([
+          listBusinessConversation(pair.currentUser.id, pair.business.id),
+          listBusinessDeals(pair.currentUser.id, pair.business.id),
+        ]);
+        if (existingMessages.length === 0 && existingDeals.length === 0) {
           acknowledge({ ok: false, error: "That business isn’t available for chat." });
           return;
         }
       }
       if (socket.accountType === "business") {
-        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
-        if (existingMessages.length === 0) {
+        const [existingMessages, existingDeals] = await Promise.all([
+          listBusinessConversation(pair.currentUser.id, pair.business.id),
+          listBusinessDeals(pair.currentUser.id, pair.business.id),
+        ]);
+        if (existingMessages.length === 0 && existingDeals.length === 0) {
           acknowledge({ ok: false, error: "The customer must start the conversation before you can reply." });
           return;
         }
@@ -223,15 +233,21 @@ io.on("connection", (socket) => {
         return;
       }
       if (socket.accountType === "user" && pair.business.isVisible === false) {
-        const existingMessages = await listBusinessConversation(pair.currentUser.id, pair.business.id);
-        if (existingMessages.length === 0) {
+        const [existingMessages, existingDeals] = await Promise.all([
+          listBusinessConversation(pair.currentUser.id, pair.business.id),
+          listBusinessDeals(pair.currentUser.id, pair.business.id),
+        ]);
+        if (existingMessages.length === 0 && existingDeals.length === 0) {
           acknowledge({ ok: false, error: "This business is not currently accepting new chats." });
           return;
         }
-        if (
-          socket.accountType === "business" &&
-          (await listBusinessConversation(pair.currentUser.id, pair.business.id)).length === 0
-        ) {
+      }
+      if (socket.accountType === "business") {
+        const [existingMessages, existingDeals] = await Promise.all([
+          listBusinessConversation(pair.currentUser.id, pair.business.id),
+          listBusinessDeals(pair.currentUser.id, pair.business.id),
+        ]);
+        if (existingMessages.length === 0 && existingDeals.length === 0) {
           acknowledge({ ok: false, error: "The customer must start the conversation before you can reply." });
           return;
         }
@@ -280,6 +296,7 @@ async function startServer() {
   await initializeConnectionStore();
   await initializeBusinessStore();
   await initializeBusinessMessageStore();
+  await initializeBusinessDealStore();
   console.log("Using local JSON stores at backend/data/.");
 
   httpServer.listen(port, () => {

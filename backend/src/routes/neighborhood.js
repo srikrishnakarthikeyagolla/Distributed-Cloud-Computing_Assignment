@@ -20,6 +20,14 @@ import {
   listBusinessConversation,
   listBusinessMessagesForUser,
 } from "../models/BusinessMessage.js";
+import {
+  addBusinessDealMessage,
+  createBusinessDeal,
+  findBusinessDealById,
+  listBusinessDeals,
+  listBusinessDealsForUser,
+  updateBusinessDealStatus,
+} from "../models/BusinessDeal.js";
 
 const router = Router();
 const businessPhotoDirectory = fileURLToPath(new URL("../../data/business-photos/", import.meta.url));
@@ -148,6 +156,22 @@ function publicBusinessMessage(message) {
   };
 }
 
+function emitBusinessDealUpdate(request, deal) {
+  request.app.get("io")
+    ?.to(`business-conversation:${deal.userId}:${deal.businessId}`)
+    .to(`user:${deal.userId}`)
+    .to(`business:${deal.businessId}`)
+    .emit("business-deal:update", deal);
+}
+
+function validateDealProposal(input) {
+  const proposal = typeof input === "string" ? input.trim() : "";
+  if (!proposal || proposal.length > 2000) {
+    return { error: "Describe the proposed deal in 1 to 2,000 characters." };
+  }
+  return { proposal };
+}
+
 function businessSearchScore(business, query) {
   const terms = normalizeSearchText(query).split(/\s+/).filter(Boolean);
   if (!terms.length) return 0;
@@ -196,13 +220,147 @@ router.get("/businesses", requireAuth, async (request, response, next) => {
   }
 });
 
+router.get("/deals/active", requireAuth, async (request, response, next) => {
+  try {
+    const deals = (await listBusinessDealsForUser(request.userId))
+      .filter((deal) => deal.status === "pending" || deal.status === "accepted")
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const activeDeals = await Promise.all(deals.map(async (deal) => {
+      const business = await findBusinessById(deal.businessId);
+      return business
+        ? { ...deal, business: publicBusinessListing(business) }
+        : null;
+    }));
+    return response.json({ deals: activeDeals.filter(Boolean) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/businesses/:businessId/deals", requireAuth, async (request, response, next) => {
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
+    const [deals, messages] = await Promise.all([
+      listBusinessDeals(pair.user.id, pair.business.id),
+      listBusinessConversation(pair.user.id, pair.business.id),
+    ]);
+    if (pair.business.isVisible === false && deals.length === 0 && messages.length === 0) {
+      return response.status(404).json({ error: "That business is not accepting new conversations." });
+    }
+    return response.json({ deals });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/businesses/:businessId/deals", requireAuth, messageRateLimit, async (request, response, next) => {
+  const result = validateDealProposal(request.body?.proposal);
+  if (result.error) return response.status(400).json({ error: result.error });
+  try {
+    const pair = await getBusinessForUser(request.userId, request.params.businessId);
+    if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
+    if (pair.business.isVisible === false) {
+      const [deals, messages] = await Promise.all([
+        listBusinessDeals(pair.user.id, pair.business.id),
+        listBusinessConversation(pair.user.id, pair.business.id),
+      ]);
+      if (deals.length === 0 && messages.length === 0) {
+        return response.status(404).json({ error: "That business is not accepting new conversations." });
+      }
+    }
+    const deal = await createBusinessDeal({
+      userId: pair.user.id,
+      businessId: pair.business.id,
+      creatorType: "user",
+      proposal: result.proposal,
+    });
+    emitBusinessDealUpdate(request, deal);
+    return response.status(201).json({ deal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/deals/:dealId/status", requireAuth, async (request, response, next) => {
+  const action = request.body?.action;
+  if (!["accept", "pass", "fulfill"].includes(action)) {
+    return response.status(400).json({ error: "Choose an available deal action." });
+  }
+  try {
+    const deal = await findBusinessDealById(request.params.dealId);
+    const business = deal ? await findBusinessById(deal.businessId) : null;
+    const user = deal?.userId === request.userId ? await findUserById(request.userId) : null;
+    if (
+      !deal ||
+      deal.userId !== request.userId ||
+      !business ||
+      !user ||
+      user.pincode.trim().toUpperCase() !== business.pincode.trim().toUpperCase()
+    ) {
+      return response.status(404).json({ error: "That deal could not be found." });
+    }
+    if (action === "accept" || action === "pass") {
+      if (deal.status !== "pending" || deal.creatorType === "user") {
+        return response.status(409).json({ error: "This proposal is no longer awaiting your response." });
+      }
+    } else if (deal.status !== "accepted") {
+      return response.status(409).json({ error: "Only an accepted deal can be marked fulfilled." });
+    }
+    const updatedDeal = await updateBusinessDealStatus(deal.id, action, "user");
+    if (!updatedDeal) return response.status(409).json({ error: "This deal has already changed and can no longer be updated." });
+    emitBusinessDealUpdate(request, updatedDeal);
+    return response.json({ deal: updatedDeal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post("/deals/:dealId/messages", requireAuth, messageRateLimit, async (request, response, next) => {
+  const content = typeof request.body?.content === "string" ? request.body.content.trim() : "";
+  if (!content || content.length > 2000) {
+    return response.status(400).json({ error: "Messages must be between 1 and 2,000 characters." });
+  }
+  try {
+    const deal = await findBusinessDealById(request.params.dealId);
+    const [user, business] = deal?.userId === request.userId
+      ? await Promise.all([findUserById(request.userId), findBusinessById(deal.businessId)])
+      : [null, null];
+    if (
+      !deal ||
+      deal.userId !== request.userId ||
+      !user ||
+      !business ||
+      user.pincode.trim().toUpperCase() !== business.pincode.trim().toUpperCase()
+    ) return response.status(404).json({ error: "That deal could not be found." });
+    const { message, deal: updatedDeal } = await addBusinessDealMessage(deal.id, "user", content) || {};
+    if (!message) return response.status(409).json({ error: "Deal chat is available after the proposal is accepted." });
+    emitBusinessDealUpdate(request, updatedDeal);
+    return response.status(201).json({ message, deal: updatedDeal });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 router.get("/business-chats", requireAuth, async (request, response, next) => {
   try {
     const messages = await listBusinessMessagesForUser(request.userId);
+    const deals = await listBusinessDealsForUser(request.userId);
     const latestByBusiness = new Map();
     for (const message of messages) {
       const current = latestByBusiness.get(message.businessId);
       if (!current || current.createdAt < message.createdAt) latestByBusiness.set(message.businessId, message);
+    }
+    for (const deal of deals) {
+      const current = latestByBusiness.get(deal.businessId);
+      if (!current || current.createdAt < deal.updatedAt) {
+        latestByBusiness.set(deal.businessId, {
+          businessId: deal.businessId,
+          content: deal.messages.at(-1)?.content || deal.proposal,
+          createdAt: deal.updatedAt,
+          type: "deal",
+        });
+      }
     }
     const results = await Promise.all(
       [...latestByBusiness].map(async ([businessId, lastMessage]) => {
@@ -210,7 +368,7 @@ router.get("/business-chats", requireAuth, async (request, response, next) => {
         if (!business) return null;
         return {
           business: publicBusinessListing(business),
-          lastMessage: publicBusinessMessage(lastMessage),
+          lastMessage: lastMessage.id ? publicBusinessMessage(lastMessage) : lastMessage,
         };
       }),
     );
@@ -229,7 +387,8 @@ router.get("/businesses/:businessId/messages", requireAuth, async (request, resp
     const pair = await getBusinessForUser(request.userId, request.params.businessId);
     if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
     const messages = await listBusinessConversation(pair.user.id, pair.business.id);
-    if (pair.business.isVisible === false && messages.length === 0) {
+    const deals = await listBusinessDeals(pair.user.id, pair.business.id);
+    if (pair.business.isVisible === false && messages.length === 0 && deals.length === 0) {
       return response.status(404).json({ error: "That business is not accepting new chats." });
     }
     return response.json({ messages: messages.map(publicBusinessMessage) });
@@ -247,8 +406,13 @@ router.post("/businesses/:businessId/messages", requireAuth, messageRateLimit, a
     const pair = await getBusinessForUser(request.userId, request.params.businessId);
     if (!pair) return response.status(404).json({ error: "That business is not available in your area." });
     if (pair.business.isVisible === false) {
-      const existing = await listBusinessConversation(pair.user.id, pair.business.id);
-      if (existing.length === 0) return response.status(404).json({ error: "That business is not accepting new chats." });
+      const [existingMessages, existingDeals] = await Promise.all([
+        listBusinessConversation(pair.user.id, pair.business.id),
+        listBusinessDeals(pair.user.id, pair.business.id),
+      ]);
+      if (existingMessages.length === 0 && existingDeals.length === 0) {
+        return response.status(404).json({ error: "That business is not accepting new chats." });
+      }
     }
     const message = await createBusinessMessage({
       userId: pair.user.id,
@@ -273,7 +437,10 @@ router.get("/businesses/:businessId/photos/:fileName", requireAuth, async (reque
     const pair = await getBusinessForUser(request.userId, request.params.businessId);
     const fileName = request.params.fileName;
     const hasExistingConversation = pair
-      ? (await listBusinessConversation(pair.user.id, pair.business.id)).length > 0
+      ? (await Promise.all([
+        listBusinessConversation(pair.user.id, pair.business.id),
+        listBusinessDeals(pair.user.id, pair.business.id),
+      ])).some((items) => items.length > 0)
       : false;
     if (
       !pair ||

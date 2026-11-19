@@ -67,7 +67,145 @@ function ProfileAvatar({ profile, className = "", blurred = false }) {
   );
 }
 
-function BusinessInbox({ business }) {
+function DealMessageContext({ message, className = "", onCreateDeal, children }) {
+  const [menuPosition, setMenuPosition] = useState(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [proposal, setProposal] = useState(message.content);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    if (!menuPosition) return undefined;
+    function closeMenu(event) {
+      if (event.type === "keydown" && event.key === "Escape") setMenuPosition(null);
+      if (event.type === "pointerdown" && !menuRef.current?.contains(event.target)) setMenuPosition(null);
+    }
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", closeMenu);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", closeMenu);
+    };
+  }, [menuPosition]);
+
+  function openMenu(event) {
+    event.preventDefault();
+    const menuWidth = 190;
+    const menuHeight = 42;
+    setMenuPosition({
+      left: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+      top: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+    });
+  }
+
+  async function submitProposal(event) {
+    event.preventDefault();
+    const content = proposal.trim();
+    if (!content || submitting) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      await onCreateDeal(content);
+      setDialogOpen(false);
+      setMenuPosition(null);
+    } catch (submitError) {
+      setError(submitError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <>
+      <div
+        className={`message-row deal-context-target${className ? ` ${className}` : ""}`}
+        onContextMenu={openMenu}
+        onKeyDown={(event) => {
+          if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+            event.preventDefault();
+            openMenu({
+              preventDefault() {},
+              clientX: 24,
+              clientY: 24,
+            });
+          }
+        }}
+        tabIndex={0}
+        aria-label="Message. Right-click or use the context menu key to create a deal proposal."
+      >
+        {children}
+      </div>
+      {menuPosition && (
+        <div
+          ref={menuRef}
+          className="message-context-menu"
+          style={{ left: menuPosition.left, top: menuPosition.top }}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setProposal(message.content);
+              setError("");
+              setDialogOpen(true);
+              setMenuPosition(null);
+            }}
+          >
+            Propose message as a deal
+          </button>
+        </div>
+      )}
+      {dialogOpen && (
+        <div className="deal-dialog-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !submitting) setDialogOpen(false);
+        }}>
+          <form
+            className="deal-proposal-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="message-deal-heading"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !submitting) setDialogOpen(false);
+            }}
+            onSubmit={submitProposal}
+          >
+            <header>
+              <p className="eyebrow">Deal proposal</p>
+              <h2 id="message-deal-heading">Turn this message into a proposal</h2>
+              <p>Review and edit the terms before sending them for acceptance.</p>
+            </header>
+            <label htmlFor={`message-deal-${message.id}`}>Proposal details</label>
+            <textarea
+              id={`message-deal-${message.id}`}
+              value={proposal}
+              onChange={(event) => setProposal(event.target.value)}
+              maxLength={2000}
+              rows="5"
+              required
+              autoFocus
+            />
+            {error && <p className="chat-error" role="alert">{error}</p>}
+            <div className="deal-dialog-actions">
+              <button
+                className="button button-outline"
+                type="button"
+                onClick={() => setDialogOpen(false)}
+                disabled={submitting}
+              >
+                Cancel
+              </button>
+              <button className="button button-primary" type="submit" disabled={!proposal.trim() || submitting}>
+                {submitting ? "Sending…" : "Send deal proposal"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
+function BusinessInbox({ business, initialDealTarget }) {
   const [conversations, setConversations] = useState([]);
   const [selectedUser, setSelectedUser] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -75,6 +213,7 @@ function BusinessInbox({ business }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
+  const [conversationMode, setConversationMode] = useState(initialDealTarget ? "deals" : "messages");
   const socketRef = useRef(null);
   const selectedUserRef = useRef(selectedUser);
   const messagesEndRef = useRef(null);
@@ -89,7 +228,15 @@ function BusinessInbox({ business }) {
       .then(({ conversations: loaded }) => {
         if (!active) return;
         setConversations(loaded);
-        setSelectedUser((current) => current || loaded[0]?.user || null);
+        const targetConversation = initialDealTarget
+          ? loaded.find((conversation) => conversation.user.id === initialDealTarget.customer.id)
+          : null;
+        if (initialDealTarget) {
+          setSelectedUser(targetConversation?.user || initialDealTarget.customer);
+          setConversationMode("deals");
+        } else {
+          setSelectedUser((current) => current || loaded[0]?.user || null);
+        }
       })
       .catch((loadError) => setError(loadError.message))
       .finally(() => {
@@ -120,6 +267,12 @@ function BusinessInbox({ business }) {
           current.some((item) => item.id === message.id) ? current : [...current, message],
         );
       }
+    });
+    socket.on("business-deal:update", (deal) => {
+      if (deal.businessId !== business.id) return;
+      request("/api/business/conversations")
+        .then((result) => setConversations(result.conversations))
+        .catch((loadError) => setError(loadError.message));
     });
     socket.on("connect", () => {
       const activeUser = selectedUserRef.current;
@@ -186,6 +339,15 @@ function BusinessInbox({ business }) {
     }
   }
 
+  async function createDealFromMessage(proposal) {
+    if (!selectedUser) throw new Error("Select a customer conversation first.");
+    await request(`/api/business/conversations/${encodeURIComponent(selectedUser.id)}/deals`, {
+      method: "POST",
+      body: JSON.stringify({ proposal }),
+    });
+    setConversationMode("deals");
+  }
+
   return (
     <section className="community-layout business-inbox-layout" aria-label="Business customer inbox">
       <aside className="people-panel">
@@ -217,6 +379,36 @@ function BusinessInbox({ business }) {
           <div className="conversation-empty"><h2>Your business inbox</h2><p>Customer conversations will appear here.</p></div>
         ) : (
           <>
+            <div className="business-chat-mode-switch" role="tablist" aria-label="Conversation type">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={conversationMode === "messages"}
+                className={conversationMode === "messages" ? "active" : ""}
+                onClick={() => setConversationMode("messages")}
+              >
+                Messages
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={conversationMode === "deals"}
+                className={conversationMode === "deals" ? "active" : ""}
+                onClick={() => setConversationMode("deals")}
+              >
+                Deals
+              </button>
+            </div>
+            {conversationMode === "deals" ? (
+              <DealCenter
+                accountType="business"
+                userId={selectedUser.id}
+                businessId={business.id}
+                businessName={business.businessName}
+                focusedDealId={initialDealTarget?.dealId}
+              />
+            ) : (
+              <>
             <header className="conversation-header">
               <span className="avatar conversation-avatar">{selectedUser.name.charAt(0).toUpperCase()}</span>
               <span className="conversation-person"><strong>{selectedUser.name}</strong><span>Neighborhood customer</span></span>
@@ -225,13 +417,18 @@ function BusinessInbox({ business }) {
               {messages.map((message) => {
                 const ownMessage = message.senderType === "business";
                 return (
-                  <div className={`message-row${ownMessage ? " own-message" : ""}`} key={message.id}>
+                  <DealMessageContext
+                    className={ownMessage ? "own-message" : ""}
+                    key={message.id}
+                    message={message}
+                    onCreateDeal={createDealFromMessage}
+                  >
                     <div className="message-content">
                       <span className="message-sender">{ownMessage ? business.businessName : selectedUser.name}</span>
                       <p>{message.content}</p>
                       <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</time>
                     </div>
-                  </div>
+                  </DealMessageContext>
                 );
               })}
               <div ref={messagesEndRef} />
@@ -252,6 +449,8 @@ function BusinessInbox({ business }) {
                 {sending ? "Sending…" : "Send reply"} <span aria-hidden="true">↗</span>
               </button>
             </form>
+              </>
+            )}
           </>
         )}
       </section>
@@ -264,6 +463,7 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
   const [error, setError] = useState("");
   const [status, setStatus] = useState("");
   const [activeView, setActiveView] = useState("profile");
+  const [activeDealTarget, setActiveDealTarget] = useState(null);
   const photoInputRef = useRef(null);
 
   async function uploadPhotos(event) {
@@ -340,6 +540,7 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
         <nav className="topbar-nav" aria-label="Business navigation">
           <button className={`nav-button${activeView === "profile" ? " active" : ""}`} type="button" onClick={() => setActiveView("profile")}>Profile</button>
           <button className={`nav-button${activeView === "inbox" ? " active" : ""}`} type="button" onClick={() => setActiveView("inbox")}>Business chats</button>
+          <button className={`nav-button${activeView === "activeDeals" ? " active" : ""}`} type="button" onClick={() => setActiveView("activeDeals")}>Active deals</button>
         </nav>
         <div className="business-topbar-actions">
           <span>Business account</span>
@@ -347,11 +548,20 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
         </div>
       </header>
       <section className="business-dashboard-heading">
-        <p className="eyebrow">{activeView === "inbox" ? "Customer support" : "Business profile"}</p>
+        <p className="eyebrow">{activeView === "inbox" ? "Customer support" : activeView === "activeDeals" ? "Agreements" : "Business profile"}</p>
         <h1>{business.businessName}</h1>
         <p>{business.category} · {business.pincode}</p>
       </section>
-      {activeView === "inbox" ? <BusinessInbox business={business} /> : (
+      {activeView === "inbox" ? <BusinessInbox business={business} initialDealTarget={activeDealTarget} /> : activeView === "activeDeals" ? (
+        <ActiveDealsView
+          accountType="business"
+          accountId={business.id}
+          onOpenDeal={(deal) => {
+            setActiveDealTarget({ customer: deal.customer, dealId: deal.id });
+            setActiveView("inbox");
+          }}
+        />
+      ) : (
       <div className="business-dashboard-grid">
         <section className="business-profile-card">
           <div className="business-profile-card-heading">
@@ -444,12 +654,670 @@ function BusinessDashboard({ business, onSignOut, onBusinessUpdated, notice }) {
   );
 }
 
-function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
+function BusinessDirectoryView({ businesses, loading, error, search, onSearch, onOpenChat }) {
+  return (
+    <section className="business-directory-page" aria-label="Businesses nearby">
+      <header className="connections-heading">
+        <div>
+          <p className="eyebrow">Local businesses</p>
+          <h2>Discover businesses nearby</h2>
+          <p>Browse businesses in your area and start a separate business chat.</p>
+        </div>
+        <label className="connections-search">
+          <span aria-hidden="true">⌕</span>
+          <input
+            type="search"
+            placeholder="Search business, category, or service"
+            value={search}
+            onChange={(event) => onSearch(event.target.value)}
+            aria-label="Search businesses by name, category, or service"
+          />
+        </label>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {loading ? (
+        <div className="connections-empty"><h3>Finding businesses nearby…</h3></div>
+      ) : businesses.length === 0 ? (
+        <div className="connections-empty">
+          <h3>No businesses found in your area.</h3>
+          <p>Try a different search, or check back when more businesses join.</p>
+        </div>
+      ) : (
+        <div className="business-directory-grid">
+          {businesses.map((business) => (
+            <article className="business-directory-card" key={business.id}>
+              {business.photos?.length > 0 ? (
+                <img
+                  className="business-directory-photo"
+                  src={business.photos[0]}
+                  alt={`${business.businessName} preview`}
+                />
+              ) : (
+                <div className="business-directory-placeholder" aria-hidden="true">
+                  {business.businessName.charAt(0).toUpperCase()}
+                </div>
+              )}
+              <div className="business-directory-copy">
+                <span className="business-category-chip">{business.category}</span>
+                <h3>{business.businessName}</h3>
+                <p>{business.description || business.address}</p>
+                {business.services?.length > 0 && (
+                  <div className="interest-list">
+                    {business.services.slice(0, 4).map((service) => (
+                      <span className="interest-chip" key={service}>{service}</span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  className="button button-primary connection-button"
+                  type="button"
+                  onClick={() => onOpenChat(business)}
+                >
+                  Message business
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function BusinessChatsView({
+  conversations,
+  userId,
+  selectedBusiness,
+  messages,
+  draft,
+  error,
+  sending,
+  loadingMessages,
+  messagesEndRef,
+  onSelectBusiness,
+  onBrowseBusinesses,
+  onDraftChange,
+  onSendMessage,
+  onCreateDeal,
+}) {
+  const [mode, setMode] = useState("messages");
+  async function createDealFromMessage(proposal) {
+    await onCreateDeal(proposal);
+    setMode("deals");
+  }
+
+  return (
+    <section className="community-layout business-chats-layout" aria-label="Business chats">
+      <aside className="people-panel">
+        <div className="people-panel-heading">
+          <div><h2>Business chats</h2><p>{conversations.length} conversations</p></div>
+          <span className="people-count">{conversations.length}</span>
+        </div>
+        <div className="people-list">
+          {conversations.length === 0 ? (
+            <div className="people-empty">
+              <strong>No business chats yet.</strong>
+              <span>Discover a business nearby to start a conversation.</span>
+              <button className="button button-outline" type="button" onClick={onBrowseBusinesses}>Browse businesses</button>
+            </div>
+          ) : conversations.map(({ business, lastMessage }) => (
+            <button
+              className={`person-row${selectedBusiness?.id === business.id ? " selected" : ""}`}
+              key={business.id}
+              type="button"
+              onClick={() => onSelectBusiness(business)}
+            >
+              <span className="avatar person-avatar">{business.businessName.charAt(0).toUpperCase()}</span>
+              <span className="person-summary">
+                <span className="person-name">{business.businessName}</span>
+                <span className="person-detail">{lastMessage.content}</span>
+              </span>
+            </button>
+          ))}
+          {selectedBusiness && !conversations.some((item) => item.business.id === selectedBusiness.id) && (
+            <button className="person-row selected" type="button" onClick={() => onSelectBusiness(selectedBusiness)}>
+              <span className="avatar person-avatar">{selectedBusiness.businessName.charAt(0).toUpperCase()}</span>
+              <span className="person-summary">
+                <span className="person-name">{selectedBusiness.businessName}</span>
+                <span className="person-detail">New conversation</span>
+              </span>
+            </button>
+          )}
+        </div>
+      </aside>
+      <section className="conversation-panel" aria-label="Business conversation">
+        {!selectedBusiness ? (
+          <div className="conversation-empty">
+            <h2>Your business chats stay separate.</h2>
+            <p>Choose a business from the list, or discover a nearby business to say hello.</p>
+          </div>
+        ) : (
+          <>
+            <div className="business-chat-mode-switch" role="tablist" aria-label="Conversation type">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === "messages"}
+                className={mode === "messages" ? "active" : ""}
+                onClick={() => setMode("messages")}
+              >
+                Messages
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={mode === "deals"}
+                className={mode === "deals" ? "active" : ""}
+                onClick={() => setMode("deals")}
+              >
+                Deals
+              </button>
+            </div>
+            {mode === "deals" ? (
+              <DealCenter
+                accountType="user"
+                userId={userId}
+                businessId={selectedBusiness.id}
+                businessName={selectedBusiness.businessName}
+              />
+            ) : (
+              <>
+            <header className="conversation-header">
+              <span className="avatar conversation-avatar">{selectedBusiness.businessName.charAt(0).toUpperCase()}</span>
+              <span className="conversation-person">
+                <strong>{selectedBusiness.businessName}</strong>
+                <span>{selectedBusiness.category} · {selectedBusiness.pincode}</span>
+                {selectedBusiness.address && <span>{selectedBusiness.address}</span>}
+              </span>
+              <span className="area-member-badge">Local business</span>
+            </header>
+            <div className="conversation-profile">
+              {selectedBusiness.description && <p>{selectedBusiness.description}</p>}
+              {selectedBusiness.photos?.length > 0 && (
+                <div className="business-chat-photos">
+                  {selectedBusiness.photos.map((photo) => (
+                    <img key={photo} src={photo} alt={`${selectedBusiness.businessName} showcase`} />
+                  ))}
+                </div>
+              )}
+            </div>
+            <div className="messages-area" aria-live="polite" aria-label="Business messages">
+              {loadingMessages && messages.length === 0 ? (
+                <p className="messages-loading">Opening your business chat…</p>
+              ) : messages.map((message) => {
+                const ownMessage = message.senderType === "user";
+                return (
+                  <DealMessageContext
+                    className={ownMessage ? "own-message" : ""}
+                    key={message.id}
+                    message={message}
+                    onCreateDeal={createDealFromMessage}
+                  >
+                    <div className="message-content">
+                      <span className="message-sender">{ownMessage ? "You" : selectedBusiness.businessName}</span>
+                      <p>{message.content}</p>
+                      <time dateTime={message.createdAt}>
+                        {new Date(message.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+                      </time>
+                    </div>
+                  </DealMessageContext>
+                );
+              })}
+              {!loadingMessages && messages.length === 0 && (
+                <div className="conversation-start">
+                  <span className="conversation-start-mark">c.</span>
+                  <strong>Start a business conversation.</strong>
+                  <span>Ask about products, services, or opening hours.</span>
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+            <form className="message-composer" onSubmit={onSendMessage}>
+              {error && <p className="chat-error" role="alert">{error}</p>}
+              <label className="sr-only" htmlFor="business-chat-draft">Write a business message</label>
+              <textarea
+                id="business-chat-draft"
+                value={draft}
+                onChange={(event) => onDraftChange(event.target.value)}
+                maxLength={2000}
+                placeholder={`Message ${selectedBusiness.businessName}…`}
+                rows="2"
+                disabled={sending}
+              />
+              <button className="button button-primary" type="submit" disabled={!draft.trim() || sending}>
+                {sending ? "Sending…" : "Send message"} <span aria-hidden="true">↗</span>
+              </button>
+            </form>
+              </>
+            )}
+          </>
+        )}
+      </section>
+    </section>
+  );
+}
+
+function DealCenter({ accountType, userId, businessId, businessName, focusedDealId }) {
+  const [deals, setDeals] = useState([]);
+  const [filter, setFilter] = useState("all");
+  const [proposal, setProposal] = useState("");
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [proposalOpen, setProposalOpen] = useState(false);
+  const [proposalSubmitting, setProposalSubmitting] = useState(false);
+  const [sending, setSending] = useState(false);
+  const focusedDealRef = useRef(null);
+
+  const listUrl = accountType === "user"
+    ? `/api/neighborhood/businesses/${encodeURIComponent(businessId)}/deals`
+    : `/api/business/conversations/${encodeURIComponent(userId)}/deals`;
+  const dealsUrl = accountType === "user" ? "/api/neighborhood/deals" : "/api/business/deals";
+  const creatorType = accountType;
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    setDeals([]);
+    request(listUrl)
+      .then(({ deals: loaded }) => {
+        if (active) {
+          setDeals(loaded);
+          setError("");
+        }
+      })
+      .catch((loadError) => {
+        if (active) setError(loadError.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    const socket = io({ withCredentials: true });
+    socket.on("business-deal:update", (updatedDeal) => {
+      if (updatedDeal.userId !== userId || updatedDeal.businessId !== businessId) return;
+      setDeals((current) => [
+        updatedDeal,
+        ...current.filter((deal) => deal.id !== updatedDeal.id),
+      ].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)));
+    });
+    socket.on("connect_error", () => {
+      setError("Live deal updates are reconnecting. Refresh to check the latest status.");
+    });
+    return () => {
+      active = false;
+      socket.disconnect();
+    };
+  }, [listUrl, userId, businessId]);
+
+  useEffect(() => {
+    if (!loading) focusedDealRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [loading, focusedDealId]);
+
+  async function createDeal(event) {
+    event.preventDefault();
+    const text = proposal.trim();
+    if (!text || proposalSubmitting) return;
+    setProposalSubmitting(true);
+    setError("");
+    try {
+      const { deal } = await request(listUrl, {
+        method: "POST",
+        body: JSON.stringify({ proposal: text }),
+      });
+      setDeals((current) => [deal, ...current.filter((item) => item.id !== deal.id)]);
+      setProposal("");
+      setProposalOpen(false);
+    } catch (createError) {
+      setError(createError.message);
+    } finally {
+      setProposalSubmitting(false);
+    }
+  }
+
+  async function updateStatus(dealId, action) {
+    setError("");
+    try {
+      const { deal } = await request(`${dealsUrl}/${encodeURIComponent(dealId)}/status`, {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      });
+      setDeals((current) => current.map((item) => item.id === deal.id ? deal : item));
+    } catch (statusError) {
+      setError(statusError.message);
+    }
+  }
+
+  async function sendDealMessage(event, dealId) {
+    event.preventDefault();
+    const content = draft.trim();
+    if (!content || sending) return;
+    setSending(true);
+    setError("");
+    try {
+      const { deal } = await request(`${dealsUrl}/${encodeURIComponent(dealId)}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ content }),
+      });
+      setDeals((current) => current.map((item) => item.id === deal.id ? deal : item));
+      setDraft("");
+    } catch (sendError) {
+      setError(sendError.message);
+    } finally {
+      setSending(false);
+    }
+  }
+
+  const visibleDeals = deals.filter((deal) => {
+    if (filter === "fulfilled") return deal.status === "fulfilled";
+    if (filter === "active") return deal.status === "pending" || deal.status === "accepted";
+    return true;
+  });
+
+  function statusLabel(status) {
+    return {
+      pending: "Awaiting response",
+      accepted: "Accepted · Active",
+      declined: "Not proceeding",
+      fulfilled: "Fulfilled",
+    }[status] || "Status unavailable";
+  }
+
+  return (
+    <div className="deal-center">
+      <header className="deal-center-heading">
+        <div>
+          <p className="eyebrow">Agreements</p>
+          <h2>Deals with {businessName}</h2>
+        </div>
+        <button className="button button-primary deal-create-toggle" type="button" onClick={() => setProposalOpen((current) => !current)}>
+          {proposalOpen ? "Cancel proposal" : "Propose a deal"}
+        </button>
+      </header>
+      {proposalOpen && (
+        <form className="deal-proposal-form" onSubmit={createDeal}>
+          <label htmlFor={`deal-proposal-${businessId}`}>Describe the proposed deal</label>
+          <textarea
+            id={`deal-proposal-${businessId}`}
+            value={proposal}
+            onChange={(event) => setProposal(event.target.value)}
+            maxLength={2000}
+            rows="3"
+            placeholder="Describe the product or service, agreed price, and any important terms…"
+            required
+          />
+          <div className="deal-form-footer">
+            <span>Both parties can review and respond before it becomes active.</span>
+            <button className="button button-primary" type="submit" disabled={!proposal.trim() || proposalSubmitting}>
+              {proposalSubmitting ? "Sending…" : "Send proposal"}
+            </button>
+          </div>
+        </form>
+      )}
+      <div className="deal-filters" role="group" aria-label="Filter deals">
+        {[
+          ["all", "All"],
+          ["active", "Active"],
+          ["fulfilled", "Fulfilled"],
+        ].map(([value, label]) => (
+          <button
+            className={filter === value ? "active" : ""}
+            type="button"
+            key={value}
+            aria-pressed={filter === value}
+            onClick={() => setFilter(value)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {loading ? (
+        <p className="deal-empty">Loading deals…</p>
+      ) : visibleDeals.length === 0 ? (
+        <div className="deal-empty">
+          <strong>{filter === "all" ? "No deal proposals yet." : `No ${filter} deals.`}</strong>
+          <span>Use “Propose a deal” to write down the terms for both parties to review.</span>
+        </div>
+      ) : (
+        <div className="deal-list">
+          {visibleDeals.map((deal) => {
+            const isCreator = deal.creatorType === creatorType;
+            const canRespond = deal.status === "pending" && !isCreator;
+            return (
+              <article
+                className={`deal-card deal-${deal.status}${deal.id === focusedDealId ? " deal-card-focused" : ""}`}
+                key={deal.id}
+                ref={deal.id === focusedDealId ? focusedDealRef : undefined}
+              >
+                <header className="deal-card-heading">
+                  <span className="deal-status">{statusLabel(deal.status)}</span>
+                  <time dateTime={deal.updatedAt}>{new Date(deal.updatedAt).toLocaleDateString()}</time>
+                </header>
+                <p className="deal-proposal">{deal.proposal}</p>
+                <span className="deal-created-by">
+                  Proposed by {isCreator ? "you" : accountType === "user" ? businessName : "the customer"}
+                </span>
+                {canRespond && (
+                  <div className="deal-actions">
+                    <button className="button button-primary" type="button" onClick={() => updateStatus(deal.id, "accept")}>Accept proposal</button>
+                    <button className="button button-outline" type="button" onClick={() => updateStatus(deal.id, "pass")}>Not at this time</button>
+                  </div>
+                )}
+                {(deal.status === "accepted" || deal.status === "fulfilled") && (
+                  <>
+                    <div className="deal-thread">
+                      <h3>Deal chat</h3>
+                      {deal.messages.map((message) => {
+                        const ownMessage = message.senderType === creatorType;
+                        return (
+                          <div className={`deal-message${ownMessage ? " own" : ""}`} key={message.id}>
+                            <span>{ownMessage ? "You" : accountType === "user" ? businessName : "Customer"}</span>
+                            <p>{message.content}</p>
+                            <time dateTime={message.createdAt}>{new Date(message.createdAt).toLocaleString()}</time>
+                          </div>
+                        );
+                      })}
+                      {deal.status === "accepted" && (
+                        <form className="deal-message-form" onSubmit={(event) => sendDealMessage(event, deal.id)}>
+                          <textarea
+                            value={draft}
+                            onChange={(event) => setDraft(event.target.value)}
+                            maxLength={2000}
+                            rows="2"
+                            placeholder="Discuss details for this deal…"
+                            aria-label="Write a deal chat message"
+                          />
+                          <button className="button button-primary" type="submit" disabled={!draft.trim() || sending}>
+                            {sending ? "Sending…" : "Send"}
+                          </button>
+                        </form>
+                      )}
+                    </div>
+                    {deal.status === "accepted" && (
+                      <button className="button button-outline deal-fulfill-button" type="button" onClick={() => updateStatus(deal.id, "fulfill")}>
+                        Mark as fulfilled
+                      </button>
+                    )}
+                  </>
+                )}
+                {deal.status === "fulfilled" && (
+                  <p className="deal-fulfilled-note">
+                    Marked fulfilled by {deal.fulfilledBy === creatorType ? "you" : accountType === "user" ? businessName : "the customer"}.
+                  </p>
+                )}
+                {deal.status === "declined" && <p className="deal-fulfilled-note">This proposal was respectfully declined.</p>}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ActiveDealsView({ accountType, accountId, onOpenDeal }) {
+  const [deals, setDeals] = useState([]);
+  const [drafts, setDrafts] = useState({});
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sendingDealId, setSendingDealId] = useState("");
+  const dealsUrl = accountType === "business" ? "/api/business/deals" : "/api/neighborhood/deals";
+  const activeDealsUrl = `${dealsUrl}/active`;
+
+  useEffect(() => {
+    let active = true;
+    const refreshDeals = () => {
+      request(activeDealsUrl)
+        .then(({ deals: loaded }) => {
+          if (active) setDeals(loaded);
+        })
+        .catch((loadError) => {
+          if (active) setError(loadError.message);
+        })
+        .finally(() => {
+          if (active) setLoading(false);
+        });
+    };
+
+    refreshDeals();
+    const socket = io({ withCredentials: true });
+    socket.on("business-deal:update", (deal) => {
+      const belongsToAccount = accountType === "business"
+        ? deal.businessId === accountId
+        : deal.userId === accountId;
+      if (belongsToAccount) refreshDeals();
+    });
+    socket.on("connect_error", () => {
+      if (active) setError("Live deal updates are reconnecting. Refresh to check the latest status.");
+    });
+    return () => {
+      active = false;
+      socket.disconnect();
+    };
+  }, [activeDealsUrl, accountType, accountId]);
+
+  async function updateStatus(dealId, action) {
+    setError("");
+    try {
+      const { deal: updatedDeal } = await request(
+        `${dealsUrl}/${encodeURIComponent(dealId)}/status`,
+        { method: "POST", body: JSON.stringify({ action }) },
+      );
+      setDeals((current) => current
+        .map((deal) => deal.id === updatedDeal.id ? { ...deal, ...updatedDeal } : deal)
+        .filter((deal) => deal.status === "pending" || deal.status === "accepted"));
+    } catch (statusError) {
+      setError(statusError.message);
+    }
+  }
+
+  async function sendReply(event, dealId) {
+    event.preventDefault();
+    const content = (drafts[dealId] || "").trim();
+    if (!content || sendingDealId) return;
+    setSendingDealId(dealId);
+    setError("");
+    try {
+      const { deal: updatedDeal } = await request(
+        `${dealsUrl}/${encodeURIComponent(dealId)}/messages`,
+        { method: "POST", body: JSON.stringify({ content }) },
+      );
+      setDeals((current) => current.map((deal) =>
+        deal.id === updatedDeal.id ? { ...deal, ...updatedDeal } : deal,
+      ));
+      setDrafts((current) => ({ ...current, [dealId]: "" }));
+    } catch (sendError) {
+      setError(sendError.message);
+    } finally {
+      setSendingDealId("");
+    }
+  }
+
+  const partyName = (deal) => accountType === "business"
+    ? deal.customer?.name || "Customer"
+    : deal.business?.businessName || "Business";
+
+  return (
+    <section className="active-deals-page" aria-labelledby="active-deals-heading">
+      <header className="connections-heading">
+        <div>
+          <p className="eyebrow">Deal center</p>
+          <h2 id="active-deals-heading">Active deals</h2>
+          <p>Keep up with proposals and continue accepted deal conversations.</p>
+        </div>
+        <span className="people-count">{deals.length} active</span>
+      </header>
+      {error && <p className="chat-error" role="alert">{error}</p>}
+      {loading ? (
+        <p className="deal-empty">Loading active deals…</p>
+      ) : deals.length === 0 ? (
+        <div className="deal-empty">
+          <strong>No active deals right now.</strong>
+          <span>New proposals and accepted deals will appear here.</span>
+        </div>
+      ) : (
+        <div className="active-deals-list">
+          {deals.map((deal) => {
+            const lastMessage = deal.messages.at(-1);
+            const lastMessageText = lastMessage?.content || deal.proposal;
+            const subject = deal.proposal.split(/\r?\n/, 1)[0];
+            const canRespond = deal.status === "pending" && deal.creatorType !== accountType;
+            return (
+              <article className="active-deal-card" key={deal.id}>
+                <button className="active-deal-summary" type="button" onClick={() => onOpenDeal(deal)}>
+                  <span className="active-deal-summary-heading">
+                    <strong>{partyName(deal)}</strong>
+                    <span className={`deal-status active-deal-status-${deal.status}`}>
+                      {deal.status === "pending" ? "Awaiting response" : "Accepted · Active"}
+                    </span>
+                  </span>
+                  <span className="active-deal-subject"><b>Subject:</b> {subject}</span>
+                  <span className="active-deal-last-message">
+                    <b>Last message:</b> {lastMessageText}
+                  </span>
+                  <span className="active-deal-open-hint">Open full deal →</span>
+                </button>
+                {canRespond && (
+                  <div className="deal-actions active-deal-actions">
+                    <button className="button button-primary" type="button" onClick={() => updateStatus(deal.id, "accept")}>Accept proposal</button>
+                    <button className="button button-outline" type="button" onClick={() => updateStatus(deal.id, "pass")}>Not at this time</button>
+                  </div>
+                )}
+                {deal.status === "accepted" && (
+                  <form className="active-deal-reply" onSubmit={(event) => sendReply(event, deal.id)}>
+                    <label className="sr-only" htmlFor={`active-deal-reply-${deal.id}`}>Reply to {partyName(deal)} about this deal</label>
+                    <input
+                      id={`active-deal-reply-${deal.id}`}
+                      value={drafts[deal.id] || ""}
+                      onChange={(event) => setDrafts((current) => ({ ...current, [deal.id]: event.target.value }))}
+                      maxLength={2000}
+                      placeholder="Reply about this deal…"
+                      disabled={sendingDealId === deal.id}
+                    />
+                    <button className="button button-primary" type="submit" disabled={!drafts[deal.id]?.trim() || Boolean(sendingDealId)}>
+                      {sendingDealId === deal.id ? "Sending…" : "Reply"}
+                    </button>
+                  </form>
+                )}
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function NeighborhoodDashboard({ user, onSignOut, onUserUpdated, initialLastSection }) {
   const [people, setPeople] = useState([]);
   const [connectionPeople, setConnectionPeople] = useState([]);
   const [loadingConnections, setLoadingConnections] = useState(true);
   const [pendingConnectionCount, setPendingConnectionCount] = useState(0);
-  const [activeView, setActiveView] = useState("messages");
+  const [activeView, setActiveView] = useState(
+    initialLastSection === "business" ? "businesses" : "messages",
+  );
   const [connectionSearch, setConnectionSearch] = useState("");
   const [visibility, setVisibility] = useState(user.visibility || "connections");
   const [savingVisibility, setSavingVisibility] = useState(false);
@@ -471,11 +1339,14 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   const [loadingBusinesses, setLoadingBusinesses] = useState(false);
   const [businessConversations, setBusinessConversations] = useState([]);
   const [selectedBusiness, setSelectedBusiness] = useState(null);
+  const [businessChatMode, setBusinessChatMode] = useState("messages");
+  const [focusedBusinessDealId, setFocusedBusinessDealId] = useState(null);
   const [businessMessages, setBusinessMessages] = useState([]);
   const [businessDraft, setBusinessDraft] = useState("");
   const [businessChatError, setBusinessChatError] = useState("");
   const [businessSending, setBusinessSending] = useState(false);
   const [loadingBusinessMessages, setLoadingBusinessMessages] = useState(false);
+  const [sectionError, setSectionError] = useState("");
   const messagesEndRef = useRef(null);
   const socketRef = useRef(null);
   const selectedPersonRef = useRef(selectedPerson);
@@ -483,6 +1354,8 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   const activeViewRef = useRef(activeView);
   const connectionSearchRef = useRef(connectionSearch);
   const searchRef = useRef(search);
+  const lastSectionRef = useRef(initialLastSection === "business" ? "business" : "community");
+  const sectionUpdateQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
     selectedPersonRef.current = selectedPerson;
@@ -495,6 +1368,27 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
   useEffect(() => {
     activeViewRef.current = activeView;
   }, [activeView]);
+
+  function navigateToView(nextView) {
+    setActiveView(nextView);
+    const nextSection = ["businesses", "businessChats", "activeDeals"].includes(nextView)
+      ? "business"
+      : "community";
+    if (lastSectionRef.current === nextSection) return;
+    const previousSection = lastSectionRef.current;
+    lastSectionRef.current = nextSection;
+    setSectionError("");
+    sectionUpdateQueueRef.current = sectionUpdateQueueRef.current
+      .catch(() => {})
+      .then(() => request("/api/auth/last-section", {
+        method: "POST",
+        body: JSON.stringify({ section: nextSection }),
+      }))
+      .catch((sectionUpdateError) => {
+        lastSectionRef.current = previousSection;
+        setSectionError(sectionUpdateError.message);
+      });
+  }
 
   useEffect(() => {
     connectionSearchRef.current = connectionSearch;
@@ -537,6 +1431,13 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
             : [...current, message],
         );
       }
+      request("/api/neighborhood/business-chats")
+        .then((result) => setBusinessConversations(result.conversations))
+        .catch((loadError) => setBusinessChatError(loadError.message));
+    });
+
+    socket.on("business-deal:update", (deal) => {
+      if (deal.userId !== user.id) return;
       request("/api/neighborhood/business-chats")
         .then((result) => setBusinessConversations(result.conversations))
         .catch((loadError) => setBusinessChatError(loadError.message));
@@ -800,8 +1701,9 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
 
   function openBusinessChat(business) {
     setSelectedBusiness(business);
+    setBusinessChatMode("messages");
     setBusinessChatError("");
-    setActiveView("businessChats");
+    navigateToView("businessChats");
   }
 
   async function sendBusinessMessage(event) {
@@ -831,6 +1733,27 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
     } finally {
       setBusinessSending(false);
     }
+  }
+
+  async function createDealFromMessage(proposal) {
+    if (!selectedBusiness) throw new Error("Select a business conversation first.");
+    await request(`/api/neighborhood/businesses/${encodeURIComponent(selectedBusiness.id)}/deals`, {
+      method: "POST",
+      body: JSON.stringify({ proposal }),
+    });
+    setBusinessConversations((current) => {
+      return [
+        {
+          business: selectedBusiness,
+          lastMessage: {
+            content: proposal,
+            createdAt: new Date().toISOString(),
+            type: "deal",
+          },
+        },
+        ...current.filter((item) => item.business.id !== selectedBusiness.id),
+      ];
+    });
   }
 
   const filteredPeople = people;
@@ -976,14 +1899,14 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
           <button
             className={`nav-button${activeView === "messages" ? " active" : ""}`}
             type="button"
-            onClick={() => setActiveView("messages")}
+            onClick={() => navigateToView("messages")}
           >
             Messages
           </button>
           <button
             className={`nav-button${activeView === "connections" ? " active" : ""}`}
             type="button"
-            onClick={() => setActiveView("connections")}
+            onClick={() => navigateToView("connections")}
           >
             Connect
             {pendingConnectionCount > 0 && (
@@ -993,28 +1916,20 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
             )}
           </button>
           <button
-            className={`nav-button${activeView === "businesses" ? " active" : ""}`}
+            className={`nav-button${["businesses", "businessChats", "activeDeals"].includes(activeView) ? " active" : ""}`}
             type="button"
-            onClick={() => setActiveView("businesses")}
-          >
-            Businesses
-          </button>
-          <button
-            className={`nav-button${activeView === "businessChats" ? " active" : ""}`}
-            type="button"
-            onClick={() => setActiveView("businessChats")}
-          >
-            Business chats
-            {businessConversations.length > 0 && (
-              <span className="nav-count" aria-label={`${businessConversations.length} business conversations`}>
-                {businessConversations.length}
-              </span>
+            onClick={() => navigateToView(
+              ["businesses", "businessChats", "activeDeals"].includes(activeView)
+                ? activeView
+                : "businesses",
             )}
+          >
+            Business
           </button>
           <button
             className={`nav-button${activeView === "profile" ? " active" : ""}`}
             type="button"
-            onClick={() => setActiveView("profile")}
+            onClick={() => navigateToView("profile")}
           >
             Profile
           </button>
@@ -1029,17 +1944,59 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
 
       <section className="community-heading">
         <div>
-          <p className="eyebrow">Your neighborhood</p>
-          <h1>Good to have you here, {user.name.split(" ")[0]}.</h1>
-          <p className="community-subtitle">
-            Meet people in your area and start a conversation.
-          </p>
+          {["businesses", "businessChats", "activeDeals"].includes(activeView) ? (
+            <>
+              <p className="eyebrow">Local business</p>
+              <h1>Explore businesses in your area.</h1>
+              <p className="community-subtitle">Discover local businesses, manage chats, and follow your deals.</p>
+            </>
+          ) : (
+            <>
+              <p className="eyebrow">Your neighborhood</p>
+              <h1>Good to have you here, {user.name.split(" ")[0]}.</h1>
+              <p className="community-subtitle">Meet people in your area and start a conversation.</p>
+            </>
+          )}
         </div>
         <div className="area-badge">
           <span aria-hidden="true">⌖</span>
           <span>Area pincode <strong>{user.pincode}</strong></span>
         </div>
       </section>
+
+      {["businesses", "businessChats", "activeDeals"].includes(activeView) && (
+        <nav className="business-section-nav" aria-label="Business section">
+          <button
+            className={activeView === "businesses" ? "active" : ""}
+            type="button"
+            aria-current={activeView === "businesses" ? "page" : undefined}
+            onClick={() => navigateToView("businesses")}
+          >
+            Discover businesses
+          </button>
+          <button
+            className={activeView === "businessChats" ? "active" : ""}
+            type="button"
+            aria-current={activeView === "businessChats" ? "page" : undefined}
+            onClick={() => {
+              setBusinessChatMode("messages");
+              navigateToView("businessChats");
+            }}
+          >
+            Business chats
+            {businessConversations.length > 0 && <span className="nav-count">{businessConversations.length}</span>}
+          </button>
+          <button
+            className={activeView === "activeDeals" ? "active" : ""}
+            type="button"
+            aria-current={activeView === "activeDeals" ? "page" : undefined}
+            onClick={() => navigateToView("activeDeals")}
+          >
+            Active deals
+          </button>
+        </nav>
+      )}
+      {sectionError && <p className="chat-error dashboard-error" role="alert">{sectionError}</p>}
 
       {activeView === "profile" ? (
         <section className="profile-settings-page" aria-labelledby="profile-settings-heading">
@@ -1193,6 +2150,60 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
           {profileStatus && <p className="profile-feedback success" role="status">{profileStatus}</p>}
           {profileError && <p className="chat-error" role="alert">{profileError}</p>}
         </section>
+      ) : activeView === "businesses" ? (
+        <BusinessDirectoryView
+          businesses={businesses}
+          loading={loadingBusinesses}
+          error={businessChatError}
+          search={businessSearch}
+          onSearch={setBusinessSearch}
+          onOpenChat={openBusinessChat}
+        />
+      ) : activeView === "activeDeals" ? (
+        <ActiveDealsView
+          accountType="user"
+          accountId={user.id}
+          onOpenDeal={(deal) => {
+            setSelectedBusiness(deal.business);
+            setFocusedBusinessDealId(deal.id);
+            setBusinessChatMode("deals");
+            navigateToView("businessChats");
+          }}
+        />
+      ) : activeView === "businessChats" && businessChatMode === "deals" && selectedBusiness ? (
+        <section className="active-deal-detail-view" aria-label="Business deal conversation">
+          <button className="button button-outline" type="button" onClick={() => setBusinessChatMode("messages")}>
+            ← Business messages
+          </button>
+          <DealCenter
+            accountType="user"
+            userId={user.id}
+            businessId={selectedBusiness.id}
+            businessName={selectedBusiness.businessName}
+            focusedDealId={focusedBusinessDealId}
+          />
+        </section>
+      ) : activeView === "businessChats" ? (
+        <BusinessChatsView
+          conversations={businessConversations}
+          userId={user.id}
+          selectedBusiness={selectedBusiness}
+          messages={businessMessages}
+          draft={businessDraft}
+          error={businessChatError}
+          sending={businessSending}
+          loadingMessages={loadingBusinessMessages}
+          messagesEndRef={messagesEndRef}
+          onSelectBusiness={(business) => {
+            setSelectedBusiness(business);
+            setBusinessChatMode("messages");
+            setBusinessChatError("");
+          }}
+          onBrowseBusinesses={() => navigateToView("businesses")}
+          onDraftChange={setBusinessDraft}
+          onSendMessage={sendBusinessMessage}
+          onCreateDeal={createDealFromMessage}
+        />
       ) : activeView === "connections" ? (
         <section className="connections-page" aria-label="Find and connect with people nearby">
           <header className="connections-heading">
@@ -1301,7 +2312,7 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
                     <div className="people-empty">
                       <strong>No business chats yet.</strong>
                       <span>Discover a business nearby to start a conversation.</span>
-                      <button className="button button-outline" type="button" onClick={() => setActiveView("businesses")}>Browse businesses</button>
+                      <button className="button button-outline" type="button" onClick={() => navigateToView("businesses")}>Browse businesses</button>
                     </div>
                   ) : businessConversations.map(({ business, lastMessage }) => (
                     <button
@@ -1310,6 +2321,7 @@ function NeighborhoodDashboard({ user, onSignOut, onUserUpdated }) {
                       type="button"
                       onClick={() => {
                         setSelectedBusiness(business);
+                        setBusinessChatMode("messages");
                         setBusinessChatError("");
                       }}
                     >
@@ -1636,6 +2648,7 @@ function App() {
   const [form, setForm] = useState(emptyForm);
   const [businessForm, setBusinessForm] = useState(emptyBusinessForm);
   const [user, setUser] = useState(null);
+  const [lastSection, setLastSection] = useState("community");
   const [business, setBusiness] = useState(null);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
@@ -1646,7 +2659,10 @@ function App() {
 
   useEffect(() => {
     request("/api/auth/me")
-      .then(({ user: currentUser }) => setUser(currentUser))
+      .then(({ user: currentUser, lastSection: savedSection }) => {
+        setUser(currentUser);
+        setLastSection(savedSection === "business" ? "business" : "community");
+      })
       .catch((loadError) => {
         if (loadError.status !== 401) {
           setError(loadError.message);
@@ -1848,6 +2864,7 @@ function App() {
         });
         setForm((current) => ({ ...current, password: "" }));
         setUser(result.user);
+        setLastSection("community");
       } else {
         const result = await request("/api/auth/signin", {
           method: "POST",
@@ -1855,6 +2872,7 @@ function App() {
         });
         setForm((current) => ({ ...current, password: "" }));
         setUser(result.user);
+        setLastSection(result.lastSection === "business" ? "business" : "community");
       }
     } catch (submitError) {
       setError(submitError.message);
@@ -1881,7 +2899,14 @@ function App() {
   }
 
   if (user) {
-    return <NeighborhoodDashboard user={user} onSignOut={signOut} onUserUpdated={setUser} />;
+    return (
+      <NeighborhoodDashboard
+        user={user}
+        onSignOut={signOut}
+        onUserUpdated={setUser}
+        initialLastSection={lastSection}
+      />
+    );
   }
   if (business) {
     return (
